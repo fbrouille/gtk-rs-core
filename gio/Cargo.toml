@@ -52,6 +52,12 @@ async-channel = "2.5"
 gir-format-check.workspace = true
 serial_test = "3"
 
+[target.'cfg(unix)'.dev-dependencies]
+gio-unix.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+gio-win32.workspace = true
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--generate-link-to-definition"]

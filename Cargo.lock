@@ -503,6 +503,8 @@ dependencies = [
  "futures-io",
  "futures-util",
  "gio-sys",
+ "gio-unix",
+ "gio-win32",
  "gir-format-check",
  "glib",
  "libc",

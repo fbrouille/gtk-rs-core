@@ -8,7 +8,8 @@ use crate::{
     AsyncResult, Cancellable, DriveStartFlags, File, FileAttributeInfoList, FileAttributeValue,
     FileCopyFlags, FileCreateFlags, FileEnumerator, FileIOStream, FileInfo, FileInputStream,
     FileMeasureFlags, FileMonitor, FileMonitorFlags, FileOutputStream, FileQueryInfoFlags,
-    IOErrorEnum, Mount, MountMountFlags, MountOperation, MountUnmountFlags, Task, ffi,
+    GioFuture, IOErrorEnum, LocalTask, Mount, MountMountFlags, MountOperation, MountUnmountFlags,
+    Task, ffi,
 };
 
 use libc::{c_char, c_uint};
@@ -86,6 +87,16 @@ pub trait FileImpl: ObjectImpl + ObjectSubclass<Type: IsA<File>> {
         cancellable: Option<&Cancellable>,
     ) -> Result<FileEnumerator, Error> {
         self.parent_enumerate_children(attributes, flags, cancellable)
+    }
+
+    fn enumerate_children_future(
+        &self,
+        attributes: &str,
+        flags: FileQueryInfoFlags,
+        priority: glib::Priority,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<FileEnumerator, Error>> + 'static>>
+    {
+        self.parent_enumerate_children_future(attributes, flags, priority)
     }
 
     fn query_info(
@@ -394,6 +405,53 @@ pub trait FileImpl: ObjectImpl + ObjectSubclass<Type: IsA<File>> {
     }
 }
 
+// Helper used by all `*_sync` functions of `FileImplExt` to check async operation is allowed within the current thread.
+#[inline(always)]
+fn assert_async_is_allowed() {
+    let main_context = glib::MainContext::ref_thread_default();
+    let is_main_context_owner = main_context.is_owner();
+    let has_acquired_main_context = (!is_main_context_owner)
+        .then(|| main_context.acquire().ok())
+        .flatten();
+    assert!(
+        is_main_context_owner || has_acquired_main_context.is_some(),
+        "Async operations only allowed if the thread is owning the MainContext"
+    );
+}
+
+// Generic helper trampoline used by all `*_async` functions of `FileImplExt`
+// to call the parent interface implementation of `*_finish` vfunc and then
+// invoke the user-provided callback with the result.
+#[inline(always)]
+unsafe extern "C" fn file_async_trampoline<
+    R: GlibPtrDefault + FromGlibPtrFull<<R as GlibPtrDefault>::GlibType>,
+    T: FnOnce(Result<R, Error>) + 'static,
+>(
+    source_object_ptr: *mut glib::gobject_ffi::GObject,
+    res: *mut ffi::GAsyncResult,
+    user_data: glib::ffi::gpointer,
+) {
+    unsafe {
+        let mut error = std::ptr::null_mut();
+        let cb: Box<(
+            glib::thread_guard::ThreadGuard<T>,
+            unsafe extern "C" fn(
+                *mut gio_sys::GFile,
+                *mut gio_sys::GAsyncResult,
+                *mut *mut glib::ffi::GError,
+            ) -> <R as GlibPtrDefault>::GlibType,
+        )> = Box::from_raw(user_data as *mut _);
+        let ret = cb.1(source_object_ptr as _, res, &mut error);
+        let result = if error.is_null() {
+            Ok(from_glib_full(ret))
+        } else {
+            Err(from_glib_full(error))
+        };
+        let cb = cb.0.into_inner();
+        cb(result);
+    };
+}
+
 // Support parent implementation of virtual functions defined in `gio::ffi::GFileIface` except pairs `xxx_async/xxx_finish` for which GIO provides a default implementation.
 pub trait FileImplExt: FileImpl {
     fn parent_dup(&self) -> File {
@@ -661,6 +719,66 @@ pub trait FileImplExt: FileImpl {
                 ))
             }
         }
+    }
+
+    fn parent_enumerate_children_async<R: FnOnce(Result<FileEnumerator, Error>) + 'static>(
+        &self,
+        attributes: &str,
+        flags: FileQueryInfoFlags,
+        priority: glib::Priority,
+        cancellable: Option<&Cancellable>,
+        callback: R,
+    ) {
+        assert_async_is_allowed();
+        unsafe {
+            let type_data = Self::type_data();
+            let parent_iface =
+                type_data.as_ref().parent_interface::<File>() as *const ffi::GFileIface;
+
+            let f = (*parent_iface)
+                .enumerate_children_async
+                .expect("no parent interface implementation for \"enumerate_children_async\"");
+            let finish = (*parent_iface)
+                .enumerate_children_finish
+                .expect("no parent interface \"enumerate_children_finish\" implementation");
+
+            let user_data: Box<(glib::thread_guard::ThreadGuard<R>, _)> =
+                Box::new((glib::thread_guard::ThreadGuard::new(callback), finish));
+
+            f(
+                self.obj().unsafe_cast_ref::<File>().to_glib_none().0,
+                attributes.to_glib_none().0,
+                flags.into_glib(),
+                priority.into_glib(),
+                cancellable.to_glib_none().0,
+                Some(file_async_trampoline::<FileEnumerator, R>),
+                Box::into_raw(user_data) as *mut _,
+            );
+        }
+    }
+
+    fn parent_enumerate_children_future(
+        &self,
+        attributes: &str,
+        flags: FileQueryInfoFlags,
+        priority: glib::Priority,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<FileEnumerator, Error>> + 'static>>
+    {
+        let attributes = String::from(attributes);
+        Box::pin(GioFuture::new(
+            &self.ref_counted(),
+            move |imp, cancellable, send| {
+                imp.parent_enumerate_children_async(
+                    &attributes,
+                    flags,
+                    priority,
+                    Some(cancellable),
+                    move |res| {
+                        send.resolve(res);
+                    },
+                );
+            },
+        ))
     }
 
     fn parent_query_info(
@@ -2318,6 +2436,8 @@ unsafe impl<T: FileImpl> IsImplementable<T> for File {
         iface.resolve_relative_path = Some(file_resolve_relative_path::<T>);
         iface.get_child_for_display_name = Some(file_get_child_for_display_name::<T>);
         iface.enumerate_children = Some(file_enumerate_children::<T>);
+        iface.enumerate_children_async = Some(file_enumerate_children_async::<T>);
+        iface.enumerate_children_finish = Some(file_enumerate_children_finish);
         iface.query_info = Some(file_query_info::<T>);
         iface.query_filesystem_info = Some(file_query_filesystem_info::<T>);
         iface.find_enclosing_mount = Some(file_find_enclosing_mount::<T>);
@@ -2369,10 +2489,8 @@ unsafe impl<T: FileImpl> IsImplementable<T> for File {
         }
         // `GFile` already implements `xxx_async/xxx_finish` vfuncs and this should be ok.
         // TODO: when needed, override the `GFile` implementation of the following vfuncs:
-        // iface.enumerate_children_async = Some(file_enumerate_children_async::<T>);
-        // iface.enumerate_children_finish = Some(file_enumerate_children_finish::<T>);
         // iface.query_info_async = Some(file_query_info_async::<T>);
-        // iface.query_info_finish = Some(file_query_info_finish::<T>);
+        // iface.query_info_finish = Some(file_query_info_finish);
         // iface.query_filesystem_info_async = Some(file_query_filesystem_info_async::<T>);
         // iface.query_filesystem_info_finish = Some(file_query_filesystem_info_finish::<T>);
         // iface.find_enclosing_mount_async = Some(file_find_enclosing_mount_asyncv);
@@ -2413,6 +2531,78 @@ unsafe impl<T: FileImpl> IsImplementable<T> for File {
         // iface.replace_readwrite_finish = Some(file_replace_readwrite_finish::<T>);
         // iface.measure_disk_usage_async = Some(file_measure_disk_usage_async::<T>);
         // iface.measure_disk_usage_finish = Some(file_measure_disk_usage_finish::<T>);
+    }
+}
+
+// Generic helper used by all `*_async` vfuncs:
+// creates a `LocalTask`, registers the GIO-style callback on it, and spawns
+// `future` on the thread-default main context so its result is stored in the
+// task and the callback is fired when it completes.
+//
+// The caller is responsible for obtaining `imp` and converting any C parameters
+// to Rust types before calling this function; those bindings are captured by
+// `future` in the generated `async move` block.
+#[inline(always)]
+unsafe fn spawn_async_with_local_task<
+    R: glib::value::ValueType + Into<glib::Value>,
+    F: std::future::Future<Output = Result<R, Error>> + 'static,
+>(
+    file: *mut ffi::GFile,
+    cancellable: *mut ffi::GCancellable,
+    callback: ffi::GAsyncReadyCallback,
+    user_data: glib::ffi::gpointer,
+    future: F,
+) {
+    unsafe {
+        let wrap: File = from_glib_none(file);
+        let cancellable: Option<Cancellable> = from_glib_none(cancellable);
+
+        // Closure that will invoke the C callback when the LocalTask completes
+        let closure = move |task: LocalTask<R>, source_object: Option<&glib::Object>| {
+            let result: *mut ffi::GAsyncResult = task.upcast_ref::<AsyncResult>().to_glib_none().0;
+            let source_object: *mut glib::gobject_ffi::GObject = source_object.to_glib_none().0;
+            callback.unwrap()(source_object, result, user_data)
+        };
+
+        let t = LocalTask::new(
+            Some(wrap.upcast_ref::<glib::Object>()),
+            cancellable.as_ref(),
+            closure,
+        );
+
+        // Spawn the async work on the main context
+        glib::MainContext::ref_thread_default().spawn_local(async move {
+            t.return_result(future.await);
+        });
+    }
+}
+
+// Generic helper used by all `*_finish` vfuncs that return a nullable GObject pointer.
+// Downcast `res_ptr` to a `LocalTask<R>`, propagate its result, and return the
+// owned raw pointer on success or set `*error_ptr` and return null on failure.
+#[inline(always)]
+unsafe fn finish_local_task<
+    'a,
+    R: GlibPtrDefault
+        + ToGlibPtr<'a, <R as GlibPtrDefault>::GlibType>
+        + glib::value::ValueType
+        + Into<glib::Value>,
+>(
+    res_ptr: *mut ffi::GAsyncResult,
+    error_ptr: *mut *mut glib::ffi::GError,
+) -> <R as GlibPtrDefault>::GlibType {
+    unsafe {
+        let res: AsyncResult = from_glib_none(res_ptr);
+        let t = res.downcast::<LocalTask<R>>().unwrap();
+        match t.propagate() {
+            Ok(val) => val.to_glib_full(),
+            Err(e) => {
+                if !error_ptr.is_null() {
+                    *error_ptr = e.into_glib_ptr();
+                }
+                Ptr::from::<()>(std::ptr::null_mut())
+            }
+        }
     }
 }
 
@@ -2653,6 +2843,42 @@ unsafe extern "C" fn file_enumerate_children<T: FileImpl>(
             }
         }
     }
+}
+
+unsafe extern "C" fn file_enumerate_children_async<T: FileImpl>(
+    file: *mut ffi::GFile,
+    attributes: *const c_char,
+    flags: ffi::GFileQueryInfoFlags,
+    io_priority: i32,
+    cancellable: *mut ffi::GCancellable,
+    callback: ffi::GAsyncReadyCallback,
+    user_data: glib::ffi::gpointer,
+) {
+    unsafe {
+        let instance = &*(file as *mut T::Instance);
+        let imp = instance.imp();
+        let attributes: glib::GString = from_glib_none(attributes);
+
+        spawn_async_with_local_task(
+            file,
+            cancellable,
+            callback,
+            user_data,
+            imp.enumerate_children_future(
+                attributes.as_str(),
+                from_glib(flags),
+                from_glib(io_priority),
+            ),
+        );
+    }
+}
+
+unsafe extern "C" fn file_enumerate_children_finish(
+    _file: *mut ffi::GFile,
+    res_ptr: *mut ffi::GAsyncResult,
+    error_ptr: *mut *mut glib::ffi::GError,
+) -> *mut ffi::GFileEnumerator {
+    unsafe { finish_local_task::<FileEnumerator>(res_ptr, error_ptr) }
 }
 
 unsafe extern "C" fn file_query_info<T: FileImpl>(

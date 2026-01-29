@@ -154,6 +154,14 @@ pub trait FileImpl: ObjectImpl + ObjectSubclass<Type: IsA<File>> {
         self.parent_set_display_name(display_name, cancellable)
     }
 
+    fn set_display_name_future(
+        &self,
+        display_name: &str,
+        priority: glib::Priority,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<File, Error>> + 'static>> {
+        self.parent_set_display_name_future(display_name, priority)
+    }
+
     fn query_settable_attributes(
         &self,
         cancellable: Option<&Cancellable>,
@@ -1090,6 +1098,61 @@ pub trait FileImplExt: FileImpl {
                 Err(from_glib_full(error))
             }
         }
+    }
+
+    fn parent_set_display_name_async<R: FnOnce(Result<File, Error>) + 'static>(
+        &self,
+        display_name: &str,
+        priority: glib::Priority,
+        cancellable: Option<&Cancellable>,
+        callback: R,
+    ) {
+        assert_async_is_allowed();
+        unsafe {
+            let type_data = Self::type_data();
+            let parent_iface =
+                type_data.as_ref().parent_interface::<File>() as *const ffi::GFileIface;
+
+            let f = (*parent_iface)
+                .set_display_name_async
+                .expect("no parent interface implementation for \"set_display_name_async\"");
+            let finish = (*parent_iface)
+                .set_display_name_finish
+                .expect("no parent interface \"set_display_name_finish\" implementation");
+
+            let user_data: Box<(glib::thread_guard::ThreadGuard<R>, _)> =
+                Box::new((glib::thread_guard::ThreadGuard::new(callback), finish));
+
+            f(
+                self.obj().unsafe_cast_ref::<File>().to_glib_none().0,
+                display_name.to_glib_none().0,
+                priority.into_glib(),
+                cancellable.to_glib_none().0,
+                Some(file_async_trampoline::<File, R>),
+                Box::into_raw(user_data) as *mut _,
+            );
+        }
+    }
+
+    fn parent_set_display_name_future(
+        &self,
+        display_name: &str,
+        priority: glib::Priority,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<File, Error>> + 'static>> {
+        let display_name = String::from(display_name);
+        Box::pin(GioFuture::new(
+            &self.ref_counted(),
+            move |imp, cancellable, send| {
+                imp.parent_set_display_name_async(
+                    &display_name,
+                    priority,
+                    Some(cancellable),
+                    move |res| {
+                        send.resolve(res);
+                    },
+                );
+            },
+        ))
     }
 
     fn parent_query_settable_attributes(
@@ -2635,6 +2698,8 @@ unsafe impl<T: FileImpl> IsImplementable<T> for File {
         iface.find_enclosing_mount_async = Some(file_find_enclosing_mount_async::<T>);
         iface.find_enclosing_mount_finish = Some(file_find_enclosing_mount_finish);
         iface.set_display_name = Some(file_set_display_name::<T>);
+        iface.set_display_name_async = Some(file_set_display_name_async::<T>);
+        iface.set_display_name_finish = Some(file_set_display_name_finish);
         iface.query_settable_attributes = Some(file_query_settable_attributes::<T>);
         iface.query_writable_namespaces = Some(file_query_writable_namespaces::<T>);
         iface.set_attribute = Some(file_set_attribute::<T>);
@@ -2682,8 +2747,6 @@ unsafe impl<T: FileImpl> IsImplementable<T> for File {
         }
         // `GFile` already implements `xxx_async/xxx_finish` vfuncs and this should be ok.
         // TODO: when needed, override the `GFile` implementation of the following vfuncs:
-        // iface.set_display_name_async = Some(file_set_display_name_async::<T>);
-        // iface.set_display_name_finish = Some(file_set_display_name_finish::<T>);
         // iface._query_settable_attributes_async = Some(_file_query_settable_attributes_async::<T>);
         // iface._query_settable_attributes_finish = Some(_file_query_settable_attributes_finish::<T>);
         // iface._query_writable_namespaces_async = Some(_file_query_writable_namespaces_async::<T>);
@@ -3266,6 +3329,37 @@ unsafe extern "C" fn file_set_display_name<T: FileImpl>(
             }
         }
     }
+}
+
+unsafe extern "C" fn file_set_display_name_async<T: FileImpl>(
+    file: *mut ffi::GFile,
+    display_name: *const c_char,
+    io_priority: i32,
+    cancellable: *mut ffi::GCancellable,
+    callback: ffi::GAsyncReadyCallback,
+    user_data: glib::ffi::gpointer,
+) {
+    unsafe {
+        let instance = &*(file as *mut T::Instance);
+        let imp = instance.imp();
+        let display_name: glib::GString = from_glib_none(display_name);
+
+        spawn_async_with_local_task(
+            file,
+            cancellable,
+            callback,
+            user_data,
+            imp.set_display_name_future(display_name.as_str(), from_glib(io_priority)),
+        );
+    }
+}
+
+unsafe extern "C" fn file_set_display_name_finish(
+    _file: *mut ffi::GFile,
+    res_ptr: *mut ffi::GAsyncResult,
+    error_ptr: *mut *mut glib::ffi::GError,
+) -> *mut ffi::GFile {
+    unsafe { finish_local_task::<File>(res_ptr, error_ptr) }
 }
 
 unsafe extern "C" fn file_query_settable_attributes<T: FileImpl>(

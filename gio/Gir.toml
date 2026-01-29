@@ -821,10 +821,6 @@ manual_traits = ["FileExtManual"]
     # FileEnumerator
     ignore = true
     [[object.function]]
-    name = "find_enclosing_mount_async"
-    # Mount
-    ignore = true
-    [[object.function]]
     name = "replace_contents_async"
     # AsRef
     manual = true

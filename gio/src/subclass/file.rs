@@ -139,6 +139,13 @@ pub trait FileImpl: ObjectImpl + ObjectSubclass<Type: IsA<File>> {
         self.parent_find_enclosing_mount(cancellable)
     }
 
+    fn find_enclosing_mount_future(
+        &self,
+        priority: glib::Priority,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Mount, Error>> + 'static>> {
+        self.parent_find_enclosing_mount_future(priority)
+    }
+
     fn set_display_name(
         &self,
         display_name: &str,
@@ -1009,6 +1016,52 @@ pub trait FileImplExt: FileImpl {
                 ))
             }
         }
+    }
+
+    fn parent_find_enclosing_mount_async<R: FnOnce(Result<Mount, Error>) + 'static>(
+        &self,
+        priority: glib::Priority,
+        cancellable: Option<&Cancellable>,
+        callback: R,
+    ) {
+        assert_async_is_allowed();
+        unsafe {
+            let type_data = Self::type_data();
+            let parent_iface =
+                type_data.as_ref().parent_interface::<File>() as *const ffi::GFileIface;
+
+            let f = (*parent_iface)
+                .find_enclosing_mount_async
+                .expect("no parent interface implementation for \"find_enclosing_mount_async\"");
+            let finish = (*parent_iface)
+                .find_enclosing_mount_finish
+                .expect("no parent interface \"find_enclosing_mount_finish\" implementation");
+
+            let user_data: Box<(glib::thread_guard::ThreadGuard<R>, _)> =
+                Box::new((glib::thread_guard::ThreadGuard::new(callback), finish));
+
+            f(
+                self.obj().unsafe_cast_ref::<File>().to_glib_none().0,
+                priority.into_glib(),
+                cancellable.to_glib_none().0,
+                Some(file_async_trampoline::<Mount, R>),
+                Box::into_raw(user_data) as *mut _,
+            );
+        }
+    }
+
+    fn parent_find_enclosing_mount_future(
+        &self,
+        priority: glib::Priority,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Mount, Error>> + 'static>> {
+        Box::pin(GioFuture::new(
+            &self.ref_counted(),
+            move |imp, cancellable, send| {
+                imp.parent_find_enclosing_mount_async(priority, Some(cancellable), move |res| {
+                    send.resolve(res);
+                });
+            },
+        ))
     }
 
     fn parent_set_display_name(
@@ -2579,6 +2632,8 @@ unsafe impl<T: FileImpl> IsImplementable<T> for File {
         iface.query_filesystem_info_async = Some(file_query_filesystem_info_async::<T>);
         iface.query_filesystem_info_finish = Some(file_query_filesystem_info_finish);
         iface.find_enclosing_mount = Some(file_find_enclosing_mount::<T>);
+        iface.find_enclosing_mount_async = Some(file_find_enclosing_mount_async::<T>);
+        iface.find_enclosing_mount_finish = Some(file_find_enclosing_mount_finish);
         iface.set_display_name = Some(file_set_display_name::<T>);
         iface.query_settable_attributes = Some(file_query_settable_attributes::<T>);
         iface.query_writable_namespaces = Some(file_query_writable_namespaces::<T>);
@@ -2627,8 +2682,6 @@ unsafe impl<T: FileImpl> IsImplementable<T> for File {
         }
         // `GFile` already implements `xxx_async/xxx_finish` vfuncs and this should be ok.
         // TODO: when needed, override the `GFile` implementation of the following vfuncs:
-        // iface.find_enclosing_mount_async = Some(file_find_enclosing_mount_asyncv);
-        // iface.find_enclosing_mount_finish = Some(file_find_enclosing_mount_finish::<T>);
         // iface.set_display_name_async = Some(file_set_display_name_async::<T>);
         // iface.set_display_name_finish = Some(file_set_display_name_finish::<T>);
         // iface._query_settable_attributes_async = Some(_file_query_settable_attributes_async::<T>);
@@ -3157,6 +3210,35 @@ unsafe extern "C" fn file_find_enclosing_mount<T: FileImpl>(
             }
         }
     }
+}
+
+unsafe extern "C" fn file_find_enclosing_mount_async<T: FileImpl>(
+    file: *mut ffi::GFile,
+    io_priority: i32,
+    cancellable: *mut ffi::GCancellable,
+    callback: ffi::GAsyncReadyCallback,
+    user_data: glib::ffi::gpointer,
+) {
+    unsafe {
+        let instance = &*(file as *mut T::Instance);
+        let imp = instance.imp();
+
+        spawn_async_with_local_task(
+            file,
+            cancellable,
+            callback,
+            user_data,
+            imp.find_enclosing_mount_future(from_glib(io_priority)),
+        );
+    }
+}
+
+unsafe extern "C" fn file_find_enclosing_mount_finish(
+    _file: *mut ffi::GFile,
+    res_ptr: *mut ffi::GAsyncResult,
+    error_ptr: *mut *mut glib::ffi::GError,
+) -> *mut ffi::GMount {
+    unsafe { finish_local_task::<Mount>(res_ptr, error_ptr) }
 }
 
 unsafe extern "C" fn file_set_display_name<T: FileImpl>(

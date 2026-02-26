@@ -209,6 +209,15 @@ pub trait FileImpl: ObjectImpl + ObjectSubclass<Type: IsA<File>> {
         self.parent_read_fn(cancellable)
     }
 
+    fn read_future(
+        &self,
+        priority: glib::Priority,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<FileInputStream, Error>> + 'static>,
+    > {
+        self.parent_read_future(priority)
+    }
+
     fn append_to(
         &self,
         flags: FileCreateFlags,
@@ -1411,6 +1420,54 @@ pub trait FileImplExt: FileImpl {
                 ))
             }
         }
+    }
+
+    fn parent_read_async<R: FnOnce(Result<FileInputStream, Error>) + 'static>(
+        &self,
+        priority: glib::Priority,
+        cancellable: Option<&Cancellable>,
+        callback: R,
+    ) {
+        assert_async_is_allowed();
+        unsafe {
+            let type_data = Self::type_data();
+            let parent_iface =
+                type_data.as_ref().parent_interface::<File>() as *const ffi::GFileIface;
+
+            let f = (*parent_iface)
+                .read_async
+                .expect("no parent interface implementation for \"read_async\"");
+            let finish = (*parent_iface)
+                .read_finish
+                .expect("no parent interface \"read_finish\" implementation");
+
+            let user_data: Box<(glib::thread_guard::ThreadGuard<R>, _)> =
+                Box::new((glib::thread_guard::ThreadGuard::new(callback), finish));
+
+            f(
+                self.obj().unsafe_cast_ref::<File>().to_glib_none().0,
+                priority.into_glib(),
+                cancellable.to_glib_none().0,
+                Some(file_async_trampoline::<FileInputStream, R>),
+                Box::into_raw(user_data) as *mut _,
+            );
+        }
+    }
+
+    fn parent_read_future(
+        &self,
+        priority: glib::Priority,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<FileInputStream, Error>> + 'static>,
+    > {
+        Box::pin(GioFuture::new(
+            &self.ref_counted(),
+            move |imp, cancellable, send| {
+                imp.parent_read_async(priority, Some(cancellable), move |res| {
+                    send.resolve(res);
+                });
+            },
+        ))
     }
 
     fn parent_append_to(
@@ -2814,6 +2871,8 @@ unsafe impl<T: FileImpl> IsImplementable<T> for File {
         iface.set_attributes_finish = Some(file_set_attributes_finish);
         iface.set_attributes_from_info = Some(file_set_attributes_from_info::<T>);
         iface.read_fn = Some(file_read_fn::<T>);
+        iface.read_async = Some(file_read_async::<T>);
+        iface.read_finish = Some(file_read_finish);
         iface.append_to = Some(file_append_to::<T>);
         iface.create = Some(file_create::<T>);
         iface.replace = Some(file_replace::<T>);
@@ -2860,8 +2919,6 @@ unsafe impl<T: FileImpl> IsImplementable<T> for File {
         // iface._query_settable_attributes_finish = Some(_file_query_settable_attributes_finish::<T>);
         // iface._query_writable_namespaces_async = Some(_file_query_writable_namespaces_async::<T>);
         // iface._query_writable_namespaces_finish = Some(_file_query_writable_namespaces_finish::<T>);
-        // iface.read_async = Some(file_read_async::<T>);
-        // iface.read_finish = Some(file_read_finish::<T>);
         // iface.append_to_async = Some(file_append_to_async::<T>);
         // iface.append_to_finish = Some(file_append_to_finish::<T>);
         // iface.create_async = Some(file_create_async::<T>);
@@ -3641,6 +3698,35 @@ unsafe extern "C" fn file_read_fn<T: FileImpl>(
             }
         }
     }
+}
+
+unsafe extern "C" fn file_read_async<T: FileImpl>(
+    file: *mut ffi::GFile,
+    io_priority: i32,
+    cancellable: *mut ffi::GCancellable,
+    callback: ffi::GAsyncReadyCallback,
+    user_data: glib::ffi::gpointer,
+) {
+    unsafe {
+        let instance = &*(file as *mut T::Instance);
+        let imp = instance.imp();
+
+        spawn_async_with_local_task(
+            file,
+            cancellable,
+            callback,
+            user_data,
+            imp.read_future(from_glib(io_priority)),
+        );
+    }
+}
+
+unsafe extern "C" fn file_read_finish(
+    _file: *mut ffi::GFile,
+    res_ptr: *mut ffi::GAsyncResult,
+    error_ptr: *mut *mut glib::ffi::GError,
+) -> *mut ffi::GFileInputStream {
+    unsafe { finish_local_task::<FileInputStream>(res_ptr, error_ptr) }
 }
 
 unsafe extern "C" fn file_append_to<T: FileImpl>(

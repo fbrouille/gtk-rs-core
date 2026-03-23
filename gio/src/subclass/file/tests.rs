@@ -596,6 +596,20 @@ mod imp {
             }
         }
 
+        fn delete_future(
+            &self,
+            _priority: glib::Priority,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + 'static>>
+        {
+            Box::pin(GioFuture::new(
+                &self.ref_counted(),
+                move |self_, cancellable, send| {
+                    let res = self_.delete(Some(cancellable));
+                    send.resolve(res);
+                },
+            ))
+        }
+
         fn trash(&self, _cancellable: Option<&Cancellable>) -> Result<(), Error> {
             if self.state.get() != MyFileState::Exist {
                 Err(Error::new(IOErrorEnum::NotFound, "File does not exist"))
@@ -2350,13 +2364,48 @@ fn file_delete() {
     let err = res.unwrap_err();
 
     // invoke `MyFile` implementation of `crate::ffi::GFileIface::delete`
-    let res = my_custom_file.delete(Cancellable::NONE);
+    let res = my_file.delete(Cancellable::NONE);
     assert!(res.is_err(), "unexpected deleted file");
     let expected = res.unwrap_err();
 
     // both errors should equal
     assert_eq!(err.message(), expected.message());
     assert_eq!(err.kind::<IOErrorEnum>(), expected.kind::<IOErrorEnum>());
+}
+
+#[test]
+fn file_delete_future() {
+    // run test in a main context dedicated and configured as the thread default one
+    let _ = glib::MainContext::new().with_thread_default(|| {
+        // invoke `MyCustomFile` implementation of `crate::ffi::GFileIface::delete_async/finish`
+        let my_custom_file =
+            MyCustomFile::with_type_state("/my_file", FileType::Unknown, MyFileState::Exist);
+        let res = glib::MainContext::ref_thread_default()
+            .block_on(my_custom_file.delete_future(glib::Priority::DEFAULT));
+        assert!(res.is_ok(), "{}", res.unwrap_err());
+
+        // invoke `MyFile` implementation of `crate::ffi::GFileIface::delete_async/finish`
+        let my_file = MyFile::with_type_state("/my_file", FileType::Unknown, MyFileState::Exist);
+        let res = glib::MainContext::ref_thread_default()
+            .block_on(my_file.delete_future(glib::Priority::DEFAULT));
+        assert!(res.is_ok(), "{}", res.unwrap_err());
+
+        // invoke `MyCustomFile` implementation of `crate::ffi::GFileIface::delete_async/finish`
+        let res = glib::MainContext::ref_thread_default()
+            .block_on(my_custom_file.delete_future(glib::Priority::DEFAULT));
+        assert!(res.is_err(), "unexpected deleted file");
+        let err = res.unwrap_err();
+
+        // invoke `MyFile` implementation of `crate::ffi::GFileIface::delete_async/finish`
+        let res = glib::MainContext::ref_thread_default()
+            .block_on(my_file.delete_future(glib::Priority::DEFAULT));
+        assert!(res.is_err(), "unexpected deleted file");
+        let expected = res.unwrap_err();
+
+        // both errors should equal
+        assert_eq!(err.message(), expected.message());
+        assert_eq!(err.kind::<IOErrorEnum>(), expected.kind::<IOErrorEnum>());
+    });
 }
 
 #[test]

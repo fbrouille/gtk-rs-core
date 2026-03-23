@@ -3147,78 +3147,6 @@ unsafe impl<T: FileImpl> IsImplementable<T> for File {
     }
 }
 
-// Generic helper used by all `*_async` vfuncs:
-// creates a `LocalTask`, registers the GIO-style callback on it, and spawns
-// `future` on the thread-default main context so its result is stored in the
-// task and the callback is fired when it completes.
-//
-// The caller is responsible for obtaining `imp` and converting any C parameters
-// to Rust types before calling this function; those bindings are captured by
-// `future` in the generated `async move` block.
-#[inline(always)]
-unsafe fn spawn_async_with_local_task<
-    R: glib::value::ValueType + Into<glib::Value>,
-    F: std::future::Future<Output = Result<R, Error>> + 'static,
->(
-    file: *mut ffi::GFile,
-    cancellable: *mut ffi::GCancellable,
-    callback: ffi::GAsyncReadyCallback,
-    user_data: glib::ffi::gpointer,
-    future: F,
-) {
-    unsafe {
-        let wrap: File = from_glib_none(file);
-        let cancellable: Option<Cancellable> = from_glib_none(cancellable);
-
-        // Closure that will invoke the C callback when the LocalTask completes
-        let closure = move |task: LocalTask<R>, source_object: Option<&glib::Object>| {
-            let result: *mut ffi::GAsyncResult = task.upcast_ref::<AsyncResult>().to_glib_none().0;
-            let source_object: *mut glib::gobject_ffi::GObject = source_object.to_glib_none().0;
-            callback.unwrap()(source_object, result, user_data)
-        };
-
-        let t = LocalTask::new(
-            Some(wrap.upcast_ref::<glib::Object>()),
-            cancellable.as_ref(),
-            closure,
-        );
-
-        // Spawn the async work on the main context
-        glib::MainContext::ref_thread_default().spawn_local(async move {
-            t.return_result(future.await);
-        });
-    }
-}
-
-// Generic helper used by all `*_finish` vfuncs that return a nullable GObject pointer.
-// Downcast `res_ptr` to a `LocalTask<R>`, propagate its result, and return the
-// owned raw pointer on success or set `*error_ptr` and return null on failure.
-#[inline(always)]
-unsafe fn finish_local_task<
-    'a,
-    R: GlibPtrDefault
-        + ToGlibPtr<'a, <R as GlibPtrDefault>::GlibType>
-        + glib::value::ValueType
-        + Into<glib::Value>,
->(
-    res_ptr: *mut ffi::GAsyncResult,
-    error_ptr: *mut *mut glib::ffi::GError,
-) -> <R as GlibPtrDefault>::GlibType {
-    unsafe {
-        let res: AsyncResult = from_glib_none(res_ptr);
-        let t = res.downcast::<LocalTask<R>>().unwrap();
-        match t.propagate() {
-            Ok(val) => val.to_glib_full(),
-            Err(e) => {
-                if !error_ptr.is_null() {
-                    *error_ptr = e.into_glib_ptr();
-                }
-                Ptr::from::<()>(std::ptr::null_mut())
-            }
-        }
-    }
-}
-
 unsafe extern "C" fn file_dup<T: FileImpl>(file: *mut ffi::GFile) -> *mut ffi::GFile {
     unsafe {
         let instance = &*(file as *mut T::Instance);
@@ -3458,40 +3386,19 @@ unsafe extern "C" fn file_enumerate_children<T: FileImpl>(
     }
 }
 
-unsafe extern "C" fn file_enumerate_children_async<T: FileImpl>(
-    file: *mut ffi::GFile,
-    attributes: *const c_char,
-    flags: ffi::GFileQueryInfoFlags,
-    io_priority: i32,
-    cancellable: *mut ffi::GCancellable,
-    callback: ffi::GAsyncReadyCallback,
-    user_data: glib::ffi::gpointer,
-) {
-    unsafe {
-        let instance = &*(file as *mut T::Instance);
-        let imp = instance.imp();
-        let attributes: glib::GString = from_glib_none(attributes);
-
-        spawn_async_with_local_task(
-            file,
-            cancellable,
-            callback,
-            user_data,
-            imp.enumerate_children_future(
-                attributes.as_str(),
-                from_glib(flags),
-                from_glib(io_priority),
-            ),
-        );
-    }
-}
-
-unsafe extern "C" fn file_enumerate_children_finish(
-    _file: *mut ffi::GFile,
-    res_ptr: *mut ffi::GAsyncResult,
-    error_ptr: *mut *mut glib::ffi::GError,
-) -> *mut ffi::GFileEnumerator {
-    unsafe { finish_local_task::<FileEnumerator>(res_ptr, error_ptr) }
+#[gio_macros::async_finish]
+async fn file_enumerate_children_async_result<T: FileImpl>(
+    imp: &T,
+    attributes: GString,
+    flags: FileQueryInfoFlags,
+    io_priority: glib::Priority,
+) -> Result<FileEnumerator, glib::Error> {
+    imp.enumerate_children_future(
+        attributes.as_str(),
+        flags,
+        io_priority,
+    )
+    .await
 }
 
 unsafe extern "C" fn file_query_info<T: FileImpl>(
@@ -3523,40 +3430,19 @@ unsafe extern "C" fn file_query_info<T: FileImpl>(
     }
 }
 
-unsafe extern "C" fn file_query_info_async<T: FileImpl>(
-    file: *mut ffi::GFile,
-    attributes: *const c_char,
-    flags: ffi::GFileQueryInfoFlags,
-    io_priority: i32,
-    cancellable: *mut ffi::GCancellable,
-    callback: ffi::GAsyncReadyCallback,
-    user_data: glib::ffi::gpointer,
-) {
-    unsafe {
-        let instance = &*(file as *mut T::Instance);
-        let imp = instance.imp();
-        let attributes: glib::GString = from_glib_none(attributes);
-
-        spawn_async_with_local_task(
-            file,
-            cancellable,
-            callback,
-            user_data,
-            imp.query_info_future(
-                attributes.as_str(),
-                from_glib(flags),
-                from_glib(io_priority),
-            ),
-        );
-    }
-}
-
-unsafe extern "C" fn file_query_info_finish(
-    _file: *mut ffi::GFile,
-    res_ptr: *mut ffi::GAsyncResult,
-    error_ptr: *mut *mut glib::ffi::GError,
-) -> *mut ffi::GFileInfo {
-    unsafe { finish_local_task::<FileInfo>(res_ptr, error_ptr) }
+#[gio_macros::async_finish]
+async fn file_query_info_async_result<T: FileImpl>(
+    imp: &T,
+    attributes: GString,
+    flags: FileQueryInfoFlags,
+    io_priority: glib::Priority,
+) -> Result<FileInfo, glib::Error> {
+    imp.query_info_future(
+        attributes.as_str(),
+        flags,
+        io_priority,
+    )
+    .await
 }
 
 unsafe extern "C" fn file_query_filesystem_info<T: FileImpl>(
@@ -3584,35 +3470,14 @@ unsafe extern "C" fn file_query_filesystem_info<T: FileImpl>(
     }
 }
 
-unsafe extern "C" fn file_query_filesystem_info_async<T: FileImpl>(
-    file: *mut ffi::GFile,
-    attributes: *const c_char,
-    io_priority: i32,
-    cancellable: *mut ffi::GCancellable,
-    callback: ffi::GAsyncReadyCallback,
-    user_data: glib::ffi::gpointer,
-) {
-    unsafe {
-        let instance = &*(file as *mut T::Instance);
-        let imp = instance.imp();
-        let attributes: glib::GString = from_glib_none(attributes);
-
-        spawn_async_with_local_task(
-            file,
-            cancellable,
-            callback,
-            user_data,
-            imp.query_filesystem_info_future(attributes.as_str(), from_glib(io_priority)),
-        );
-    }
-}
-
-unsafe extern "C" fn file_query_filesystem_info_finish(
-    _file: *mut ffi::GFile,
-    res_ptr: *mut ffi::GAsyncResult,
-    error_ptr: *mut *mut glib::ffi::GError,
-) -> *mut ffi::GFileInfo {
-    unsafe { finish_local_task::<FileInfo>(res_ptr, error_ptr) }
+#[gio_macros::async_finish]
+async fn file_query_filesystem_info_async_result<T: FileImpl>(
+    imp: &T,
+    attributes: GString,
+    io_priority: glib::Priority,
+) -> Result<FileInfo, glib::Error> {
+    imp.query_filesystem_info_future(attributes.as_str(), io_priority)
+        .await
 }
 
 unsafe extern "C" fn file_find_enclosing_mount<T: FileImpl>(
@@ -3638,33 +3503,13 @@ unsafe extern "C" fn file_find_enclosing_mount<T: FileImpl>(
     }
 }
 
-unsafe extern "C" fn file_find_enclosing_mount_async<T: FileImpl>(
-    file: *mut ffi::GFile,
-    io_priority: i32,
-    cancellable: *mut ffi::GCancellable,
-    callback: ffi::GAsyncReadyCallback,
-    user_data: glib::ffi::gpointer,
-) {
-    unsafe {
-        let instance = &*(file as *mut T::Instance);
-        let imp = instance.imp();
-
-        spawn_async_with_local_task(
-            file,
-            cancellable,
-            callback,
-            user_data,
-            imp.find_enclosing_mount_future(from_glib(io_priority)),
-        );
-    }
-}
-
-unsafe extern "C" fn file_find_enclosing_mount_finish(
-    _file: *mut ffi::GFile,
-    res_ptr: *mut ffi::GAsyncResult,
-    error_ptr: *mut *mut glib::ffi::GError,
-) -> *mut ffi::GMount {
-    unsafe { finish_local_task::<Mount>(res_ptr, error_ptr) }
+#[gio_macros::async_finish]
+async fn file_find_enclosing_mount_async_result<T: FileImpl>(
+    imp: &T,
+    io_priority: glib::Priority,
+) -> Result<Mount, glib::Error> {
+    imp.find_enclosing_mount_future(io_priority)
+        .await
 }
 
 unsafe extern "C" fn file_set_display_name<T: FileImpl>(
@@ -3694,35 +3539,14 @@ unsafe extern "C" fn file_set_display_name<T: FileImpl>(
     }
 }
 
-unsafe extern "C" fn file_set_display_name_async<T: FileImpl>(
-    file: *mut ffi::GFile,
-    display_name: *const c_char,
-    io_priority: i32,
-    cancellable: *mut ffi::GCancellable,
-    callback: ffi::GAsyncReadyCallback,
-    user_data: glib::ffi::gpointer,
-) {
-    unsafe {
-        let instance = &*(file as *mut T::Instance);
-        let imp = instance.imp();
-        let display_name: glib::GString = from_glib_none(display_name);
-
-        spawn_async_with_local_task(
-            file,
-            cancellable,
-            callback,
-            user_data,
-            imp.set_display_name_future(display_name.as_str(), from_glib(io_priority)),
-        );
-    }
-}
-
-unsafe extern "C" fn file_set_display_name_finish(
-    _file: *mut ffi::GFile,
-    res_ptr: *mut ffi::GAsyncResult,
-    error_ptr: *mut *mut glib::ffi::GError,
-) -> *mut ffi::GFile {
-    unsafe { finish_local_task::<File>(res_ptr, error_ptr) }
+#[gio_macros::async_finish]
+async fn file_set_display_name_async_result<T: FileImpl>(
+    imp: &T,
+    display_name: GString,
+    io_priority: glib::Priority,
+) -> Result<File, glib::Error> {
+    imp.set_display_name_future(display_name.as_str(), io_priority)
+        .await
 }
 
 unsafe extern "C" fn file_query_settable_attributes<T: FileImpl>(
@@ -3804,47 +3628,15 @@ unsafe extern "C" fn file_set_attribute<T: FileImpl>(
     }
 }
 
-unsafe extern "C" fn file_set_attributes_async<T: FileImpl>(
-    file: *mut ffi::GFile,
-    info: *mut ffi::GFileInfo,
-    flags: ffi::GFileQueryInfoFlags,
-    io_priority: i32,
-    cancellable: *mut ffi::GCancellable,
-    callback: ffi::GAsyncReadyCallback,
-    user_data: glib::ffi::gpointer,
-) {
-    unsafe {
-        let instance = &*(file as *mut T::Instance);
-        let imp = instance.imp();
-        let info: FileInfo = from_glib_none(info);
-
-        spawn_async_with_local_task(
-            file,
-            cancellable,
-            callback,
-            user_data,
-            imp.set_attributes_future(&info, from_glib(flags), from_glib(io_priority)),
-        );
-    }
-}
-
-unsafe extern "C" fn file_set_attributes_finish(
-    _file: *mut ffi::GFile,
-    res_ptr: *mut ffi::GAsyncResult,
-    info_ptr: *mut *mut ffi::GFileInfo,
-    error_ptr: *mut *mut glib::ffi::GError,
-) -> glib::ffi::gboolean {
-    unsafe {
-        match finish_local_task::<FileInfo>(res_ptr, error_ptr) {
-            file_info if !file_info.is_null() => {
-                if !info_ptr.is_null() {
-                    *info_ptr = file_info;
-                }
-                glib::ffi::GTRUE
-            }
-            _ => glib::ffi::GFALSE,
-        }
-    }
+#[gio_macros::async_finish(out_param = true)]
+async fn file_set_attributes_async_result<T: FileImpl>(
+    imp: &T,
+    info: FileInfo,
+    flags: FileQueryInfoFlags,
+    io_priority: glib::Priority,
+) -> Result<FileInfo, glib::Error> {
+    imp.set_attributes_future(&info, flags, io_priority)
+        .await
 }
 
 unsafe extern "C" fn file_set_attributes_from_info<T: FileImpl>(
@@ -3899,33 +3691,12 @@ unsafe extern "C" fn file_read_fn<T: FileImpl>(
     }
 }
 
-unsafe extern "C" fn file_read_async<T: FileImpl>(
-    file: *mut ffi::GFile,
-    io_priority: i32,
-    cancellable: *mut ffi::GCancellable,
-    callback: ffi::GAsyncReadyCallback,
-    user_data: glib::ffi::gpointer,
-) {
-    unsafe {
-        let instance = &*(file as *mut T::Instance);
-        let imp = instance.imp();
-
-        spawn_async_with_local_task(
-            file,
-            cancellable,
-            callback,
-            user_data,
-            imp.read_future(from_glib(io_priority)),
-        );
-    }
-}
-
-unsafe extern "C" fn file_read_finish(
-    _file: *mut ffi::GFile,
-    res_ptr: *mut ffi::GAsyncResult,
-    error_ptr: *mut *mut glib::ffi::GError,
-) -> *mut ffi::GFileInputStream {
-    unsafe { finish_local_task::<FileInputStream>(res_ptr, error_ptr) }
+#[gio_macros::async_finish]
+async fn file_read_async_result<T: FileImpl>(
+    imp: &T,
+    io_priority: glib::Priority,
+) -> Result<FileInputStream, glib::Error> {
+    imp.read_future(io_priority).await
 }
 
 unsafe extern "C" fn file_append_to<T: FileImpl>(
@@ -3952,34 +3723,14 @@ unsafe extern "C" fn file_append_to<T: FileImpl>(
     }
 }
 
-unsafe extern "C" fn file_append_to_async<T: FileImpl>(
-    file: *mut ffi::GFile,
-    flags: ffi::GFileCreateFlags,
-    io_priority: i32,
-    cancellable: *mut ffi::GCancellable,
-    callback: ffi::GAsyncReadyCallback,
-    user_data: glib::ffi::gpointer,
-) {
-    unsafe {
-        let instance = &*(file as *mut T::Instance);
-        let imp = instance.imp();
-
-        spawn_async_with_local_task(
-            file,
-            cancellable,
-            callback,
-            user_data,
-            imp.append_to_future(from_glib(flags), from_glib(io_priority)),
-        );
-    }
-}
-
-unsafe extern "C" fn file_append_to_finish(
-    _file: *mut ffi::GFile,
-    res_ptr: *mut ffi::GAsyncResult,
-    error_ptr: *mut *mut glib::ffi::GError,
-) -> *mut ffi::GFileOutputStream {
-    unsafe { finish_local_task::<FileOutputStream>(res_ptr, error_ptr) }
+#[gio_macros::async_finish]
+async fn file_append_to_async_result<T: FileImpl>(
+    imp: &T,
+    flags: FileCreateFlags,
+    io_priority: glib::Priority,
+) -> Result<FileOutputStream, glib::Error> {
+    imp.append_to_future(flags, io_priority)
+        .await
 }
 
 unsafe extern "C" fn file_create<T: FileImpl>(
@@ -4006,34 +3757,14 @@ unsafe extern "C" fn file_create<T: FileImpl>(
     }
 }
 
-unsafe extern "C" fn file_create_async<T: FileImpl>(
-    file: *mut ffi::GFile,
-    flags: ffi::GFileCreateFlags,
-    io_priority: i32,
-    cancellable: *mut ffi::GCancellable,
-    callback: ffi::GAsyncReadyCallback,
-    user_data: glib::ffi::gpointer,
-) {
-    unsafe {
-        let instance = &*(file as *mut T::Instance);
-        let imp = instance.imp();
-
-        spawn_async_with_local_task(
-            file,
-            cancellable,
-            callback,
-            user_data,
-            imp.create_future(from_glib(flags), from_glib(io_priority)),
-        );
-    }
-}
-
-unsafe extern "C" fn file_create_finish(
-    _file: *mut ffi::GFile,
-    res_ptr: *mut ffi::GAsyncResult,
-    error_ptr: *mut *mut glib::ffi::GError,
-) -> *mut ffi::GFileOutputStream {
-    unsafe { finish_local_task::<FileOutputStream>(res_ptr, error_ptr) }
+#[gio_macros::async_finish]
+async fn file_create_async_result<T: FileImpl>(
+    imp: &T,
+    flags: FileCreateFlags,
+    io_priority: glib::Priority,
+) -> Result<FileOutputStream, glib::Error> {
+    imp.create_future(flags, io_priority)
+        .await
 }
 
 unsafe extern "C" fn file_replace<T: FileImpl>(
@@ -4068,42 +3799,21 @@ unsafe extern "C" fn file_replace<T: FileImpl>(
     }
 }
 
-unsafe extern "C" fn file_replace_async<T: FileImpl>(
-    file: *mut ffi::GFile,
-    etag: *const c_char,
-    make_backup: glib::ffi::gboolean,
-    flags: ffi::GFileCreateFlags,
-    io_priority: i32,
-    cancellable: *mut ffi::GCancellable,
-    callback: ffi::GAsyncReadyCallback,
-    user_data: glib::ffi::gpointer,
-) {
-    unsafe {
-        let instance = &*(file as *mut T::Instance);
-        let imp = instance.imp();
-        let etag = Option::<GString>::from_glib_none(etag);
-
-        spawn_async_with_local_task(
-            file,
-            cancellable,
-            callback,
-            user_data,
-            imp.replace_future(
-                etag.as_ref().map(|etag| etag.as_str()),
-                from_glib(make_backup),
-                from_glib(flags),
-                from_glib(io_priority),
-            ),
-        );
-    }
-}
-
-unsafe extern "C" fn file_replace_finish(
-    _file: *mut ffi::GFile,
-    res_ptr: *mut ffi::GAsyncResult,
-    error_ptr: *mut *mut glib::ffi::GError,
-) -> *mut ffi::GFileOutputStream {
-    unsafe { finish_local_task::<FileOutputStream>(res_ptr, error_ptr) }
+#[gio_macros::async_finish]
+async fn file_replace_async_result<T: FileImpl>(
+    imp: &T,
+    etag: Option<GString>,
+    make_backup: bool,
+    flags: FileCreateFlags,
+    io_priority: glib::Priority,
+) -> Result<FileOutputStream, glib::Error> {
+    imp.replace_future(
+        etag.as_ref().map(|etag| etag.as_str()),
+        make_backup,
+        flags,
+        io_priority,
+    )
+    .await
 }
 
 unsafe extern "C" fn file_delete_file<T: FileImpl>(

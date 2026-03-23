@@ -8,6 +8,7 @@ default-members = [
   "gdk-pixbuf/sys",
   "gio",
   "gio/sys",
+  "gio-macros",
   "gio-unix",
   "gio-unix/sys",
   "glib-build-tools",
@@ -33,6 +34,7 @@ members = [
   "gdk-pixbuf/sys",
   "gio",
   "gio/sys",
+  "gio-macros",
   "gio-unix",
   "gio-unix/sys",
   "gio-win32",
@@ -82,6 +84,7 @@ gio-sys = { path = "gio/sys", version = "0.22.0-alpha" }
 gio-unix-sys = { path = "gio-unix/sys", version = "0.22.0-alpha" }
 gio-win32-sys = { path = "gio-win32/sys", version = "0.22.0-alpha" }
 gio = { path = "gio", version = "0.22.0-alpha" }
+gio-macros = { path = "gio-macros", version = "0.22.0-alpha" }
 gio-unix = { path = "gio-unix", version = "0.22.0-alpha" }
 gio-win32 = { path = "gio-win32", version = "0.22.0-alpha" }
 pango-sys = { path = "pango/sys", version = "0.22.0-alpha" }

@@ -502,6 +502,7 @@ dependencies = [
  "futures-core",
  "futures-io",
  "futures-util",
+ "gio-macros",
  "gio-sys",
  "gir-format-check",
  "glib",
@@ -509,6 +510,15 @@ dependencies = [
  "pin-project-lite",
  "serial_test",
  "smallvec",
+]
+
+[[package]]
+name = "gio-macros"
+version = "0.22.0-alpha.3"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

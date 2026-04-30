@@ -671,6 +671,23 @@ mod imp {
             }
         }
 
+        #[cfg(feature = "v2_74")]
+        fn make_symbolic_link_future(
+            &self,
+            symlink_value: impl AsRef<std::path::Path>,
+            _priority: glib::Priority,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + 'static>>
+        {
+            let symlink_value = symlink_value.as_ref().to_owned();
+            Box::pin(GioFuture::new(
+                &self.ref_counted(),
+                move |self_, cancellable, send| {
+                    let res = self_.make_symbolic_link(symlink_value, Some(cancellable));
+                    send.resolve(res);
+                },
+            ))
+        }
+
         fn copy(
             source: &File,
             destination: &File,
@@ -2585,6 +2602,43 @@ fn file_make_symbolic_link() {
     // both errors should equal
     assert_eq!(err.message(), expected.message());
     assert_eq!(err.kind::<IOErrorEnum>(), expected.kind::<IOErrorEnum>());
+}
+
+#[test]
+#[cfg(feature = "v2_74")]
+fn file_make_symbolic_link_future() {
+    // run test in a main context dedicated and configured as the thread default one
+    let _ = glib::MainContext::new().with_thread_default(|| {
+        // invoke `MyCustomFile` implementation of `crate::ffi::GFileIface::make_symbolic_link_async/finish`
+        let my_custom_symlink = MyCustomFile::new("/my_symbolic_link");
+        let res = glib::MainContext::ref_thread_default().block_on(
+            my_custom_symlink.make_symbolic_link_future("/my_target", glib::Priority::DEFAULT),
+        );
+        assert!(res.is_ok(), "{}", res.unwrap_err());
+
+        // invoke `MyFile` implementation of `crate::ffi::GFileIface::make_symbolic_link_async/finish`
+        let my_symlink = MyFile::new("/my_symbolic_link");
+        let res = glib::MainContext::ref_thread_default()
+            .block_on(my_symlink.make_symbolic_link_future("/my_target", glib::Priority::DEFAULT));
+        assert!(res.is_ok(), "{}", res.unwrap_err());
+
+        // invoke `MyCustomFile` implementation of `crate::ffi::GFileIface::make_symbolic_link_async/finish`
+        let res = glib::MainContext::ref_thread_default().block_on(
+            my_custom_symlink.make_symbolic_link_future("/my_target", glib::Priority::DEFAULT),
+        );
+        assert!(res.is_err(), "unexpected created directory");
+        let err = res.unwrap_err();
+
+        // invoke `MyFile` implementation of `crate::ffi::GFileIface::make_symbolic_link_async/finish`
+        let res = glib::MainContext::ref_thread_default()
+            .block_on(my_symlink.make_symbolic_link_future("/my_target", glib::Priority::DEFAULT));
+        assert!(res.is_err(), "unexpected created directory");
+        let expected = res.unwrap_err();
+
+        // both errors should equal
+        assert_eq!(err.message(), expected.message());
+        assert_eq!(err.kind::<IOErrorEnum>(), expected.kind::<IOErrorEnum>());
+    });
 }
 
 #[test]

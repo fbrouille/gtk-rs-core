@@ -317,6 +317,15 @@ pub trait FileImpl: ObjectImpl + ObjectSubclass<Type: IsA<File>> {
         self.parent_make_symbolic_link(symlink_value, cancellable)
     }
 
+    #[cfg(feature = "v2_74")]
+    fn make_symbolic_link_future(
+        &self,
+        symlink_value: impl AsRef<std::path::Path>,
+        priority: glib::Priority,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + 'static>> {
+        self.parent_make_symbolic_link_future(symlink_value, priority)
+    }
+
     fn copy(
         source: &File,
         destination: &File,
@@ -2431,6 +2440,99 @@ pub trait FileImplExt: FileImpl {
         }
     }
 
+    #[cfg(feature = "v2_74")]
+    fn parent_make_symbolic_link_async<R: FnOnce(Result<(), Error>) + 'static>(
+        &self,
+        symlink_value: impl AsRef<std::path::Path>,
+        priority: glib::Priority,
+        cancellable: Option<&Cancellable>,
+        callback: R,
+    ) {
+        let main_context = glib::MainContext::ref_thread_default();
+        let is_main_context_owner = main_context.is_owner();
+        let has_acquired_main_context = (!is_main_context_owner)
+            .then(|| main_context.acquire().ok())
+            .flatten();
+        assert!(
+            is_main_context_owner || has_acquired_main_context.is_some(),
+            "Async operations only allowed if the thread is owning the MainContext"
+        );
+        unsafe {
+            let type_data = Self::type_data();
+            let parent_iface =
+                type_data.as_ref().parent_interface::<File>() as *const ffi::GFileIface;
+
+            let f = (*parent_iface)
+                .make_symbolic_link_async
+                .expect("no parent interface implementation for \"make_symbolic_link_async\"");
+            let finish = (*parent_iface)
+                .make_symbolic_link_finish
+                .expect("no parent interface \"make_symbolic_link_finish\" implementation");
+
+            let user_data: Box<(glib::thread_guard::ThreadGuard<R>, _)> =
+                Box::new((glib::thread_guard::ThreadGuard::new(callback), finish));
+
+            unsafe extern "C" fn make_symbolic_link_async_trampoline<
+                T: FnOnce(Result<(), Error>) + 'static,
+            >(
+                source_object_ptr: *mut glib::gobject_ffi::GObject,
+                res: *mut ffi::GAsyncResult,
+                user_data: glib::ffi::gpointer,
+            ) {
+                unsafe {
+                    let mut error = std::ptr::null_mut();
+                    let cb: Box<(
+                        glib::thread_guard::ThreadGuard<T>,
+                        unsafe extern "C" fn(
+                            *mut gio_sys::GFile,
+                            *mut gio_sys::GAsyncResult,
+                            *mut *mut glib::ffi::GError,
+                        ) -> glib::ffi::gboolean,
+                    )> = Box::from_raw(user_data as *mut _);
+                    cb.1(source_object_ptr as _, res, &mut error);
+                    let result = if error.is_null() {
+                        Ok(())
+                    } else {
+                        Err(from_glib_full(error))
+                    };
+                    let cb = cb.0.into_inner();
+                    cb(result);
+                };
+            }
+
+            f(
+                self.obj().unsafe_cast_ref::<File>().to_glib_none().0,
+                symlink_value.as_ref().to_glib_none().0,
+                priority.into_glib(),
+                cancellable.to_glib_none().0,
+                Some(make_symbolic_link_async_trampoline::<R>),
+                Box::into_raw(user_data) as *mut _,
+            );
+        }
+    }
+
+    #[cfg(feature = "v2_74")]
+    fn parent_make_symbolic_link_future(
+        &self,
+        symlink_value: impl AsRef<std::path::Path>,
+        priority: glib::Priority,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + 'static>> {
+        let symlink_value = symlink_value.as_ref().to_owned();
+        Box::pin(GioFuture::new(
+            &self.ref_counted(),
+            move |imp, cancellable, send| {
+                imp.parent_make_symbolic_link_async(
+                    symlink_value,
+                    priority,
+                    Some(cancellable),
+                    move |res| {
+                        send.resolve(res);
+                    },
+                );
+            },
+        ))
+    }
+
     fn parent_copy(
         source: &File,
         destination: &File,
@@ -3636,6 +3738,11 @@ unsafe impl<T: FileImpl> IsImplementable<T> for File {
         iface.make_directory_async = Some(file_make_directory_async::<T>);
         iface.make_directory_finish = Some(file_make_directory_finish);
         iface.make_symbolic_link = Some(file_make_symbolic_link::<T>);
+        #[cfg(feature = "v2_74")]
+        {
+            iface.make_symbolic_link_async = Some(file_make_symbolic_link_async::<T>);
+            iface.make_symbolic_link_finish = Some(file_make_symbolic_link_finish);
+        }
         iface.copy = Some(file_copy::<T>);
         iface.move_ = Some(file_move::<T>);
         iface.mount_mountable = Some(file_mount_mountable::<T>);
@@ -3675,8 +3782,6 @@ unsafe impl<T: FileImpl> IsImplementable<T> for File {
         // iface._query_settable_attributes_finish = Some(_file_query_settable_attributes_finish::<T>);
         // iface._query_writable_namespaces_async = Some(_file_query_writable_namespaces_async::<T>);
         // iface._query_writable_namespaces_finish = Some(_file_query_writable_namespaces_finish::<T>);
-        // iface.make_symbolic_link_async = Some(file_make_symbolic_link_async::<T>);
-        // iface.make_symbolic_link_finish = Some(file_make_symbolic_link_finish::<T>);
         // iface.copy_async = Some(file_copy_async::<T>);
         // iface.copy_finish = Some(file_copy_finish::<T>);
         // iface.move_async = Some(file_move_async::<T>);
@@ -5152,6 +5257,72 @@ unsafe extern "C" fn file_make_symbolic_link<T: FileImpl>(
                     *error = err.to_glib_full()
                 }
                 false.into_glib()
+            }
+        }
+    }
+}
+
+#[cfg(feature = "v2_74")]
+unsafe extern "C" fn file_make_symbolic_link_async<T: FileImpl>(
+    file: *mut ffi::GFile,
+    symlink_value: *const c_char,
+    io_priority: i32,
+    cancellable: *mut ffi::GCancellable,
+    callback: ffi::GAsyncReadyCallback,
+    user_data: glib::ffi::gpointer,
+) {
+    unsafe {
+        let instance = &*(file as *mut T::Instance);
+        let imp = instance.imp();
+        let wrap: File = from_glib_none(file);
+        let cancellable: Option<Cancellable> = from_glib_none(cancellable);
+
+        // Closure that will invoke the C callback when the LocalTask completes
+        let closure = move |task: LocalTask<bool>, source_object: Option<&glib::Object>| {
+            let result: *mut ffi::GAsyncResult = task.upcast_ref::<AsyncResult>().to_glib_none().0;
+            let source_object: *mut glib::gobject_ffi::GObject = source_object.to_glib_none().0;
+            callback.unwrap()(source_object, result, user_data)
+        };
+
+        let t = LocalTask::new(
+            Some(wrap.upcast_ref::<glib::Object>()),
+            cancellable.as_ref(),
+            closure,
+        );
+
+        // Spawn the async work on the main context
+        glib::MainContext::ref_thread_default().spawn_local(async move {
+            // Call the trait method's future version
+            let res = imp
+                .make_symbolic_link_future(
+                    PathBuf::from_glib_none(symlink_value),
+                    from_glib(io_priority),
+                )
+                .await;
+
+            // Store result in the task
+            t.return_result(res.map(|_| true));
+        });
+    }
+}
+
+#[cfg(feature = "v2_74")]
+unsafe extern "C" fn file_make_symbolic_link_finish(
+    _file: *mut ffi::GFile,
+    res_ptr: *mut ffi::GAsyncResult,
+    error_ptr: *mut *mut glib::ffi::GError,
+) -> glib::ffi::gboolean {
+    unsafe {
+        let res: AsyncResult = from_glib_none(res_ptr);
+        let t = res.downcast::<LocalTask<bool>>().unwrap();
+        let ret = t.propagate();
+        match ret {
+            Ok(_) => glib::ffi::GTRUE,
+            Err(e) => {
+                if !error_ptr.is_null() {
+                    *error_ptr = e.into_glib_ptr();
+                }
+                glib::ffi::GFALSE
             }
         }
     }

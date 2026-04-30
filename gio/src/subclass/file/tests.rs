@@ -619,6 +619,20 @@ mod imp {
             }
         }
 
+        fn trash_future(
+            &self,
+            _priority: glib::Priority,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + 'static>>
+        {
+            Box::pin(GioFuture::new(
+                &self.ref_counted(),
+                move |self_, cancellable, send| {
+                    let res = self_.trash(Some(cancellable));
+                    send.resolve(res);
+                },
+            ))
+        }
+
         fn make_directory(&self, _cancellable: Option<&Cancellable>) -> Result<(), Error> {
             if self.state.get() == MyFileState::Exist {
                 Err(Error::new(IOErrorEnum::Exists, "File already exists"))
@@ -2427,13 +2441,48 @@ fn file_trash() {
     let err = res.unwrap_err();
 
     // invoke `MyFile` implementation of `crate::ffi::GFileIface::trash`
-    let res = my_custom_file.trash(Cancellable::NONE);
+    let res = my_file.trash(Cancellable::NONE);
     assert!(res.is_err(), "unexpected trashed file");
     let expected = res.unwrap_err();
 
     // both errors should equal
     assert_eq!(err.message(), expected.message());
     assert_eq!(err.kind::<IOErrorEnum>(), expected.kind::<IOErrorEnum>());
+}
+
+#[test]
+fn file_trash_future() {
+    // run test in a main context dedicated and configured as the thread default one
+    let _ = glib::MainContext::new().with_thread_default(|| {
+        // invoke `MyCustomFile` implementation of `crate::ffi::GFileIface::trash_async/finish`
+        let my_custom_file =
+            MyCustomFile::with_type_state("/my_file", FileType::Unknown, MyFileState::Exist);
+        let res = glib::MainContext::ref_thread_default()
+            .block_on(my_custom_file.trash_future(glib::Priority::DEFAULT));
+        assert!(res.is_ok(), "{}", res.unwrap_err());
+
+        // invoke `MyFile` implementation of `crate::ffi::GFileIface::trash_async/finish`
+        let my_file = MyFile::with_type_state("/my_file", FileType::Unknown, MyFileState::Exist);
+        let res = glib::MainContext::ref_thread_default()
+            .block_on(my_file.trash_future(glib::Priority::DEFAULT));
+        assert!(res.is_ok(), "{}", res.unwrap_err());
+
+        // invoke `MyCustomFile` implementation of `crate::ffi::GFileIface::trash_async/finish`
+        let res = glib::MainContext::ref_thread_default()
+            .block_on(my_custom_file.trash_future(glib::Priority::DEFAULT));
+        assert!(res.is_err(), "unexpected trashed file");
+        let err = res.unwrap_err();
+
+        // invoke `MyFile` implementation of `crate::ffi::GFileIface::trash_async/finish`
+        let res = glib::MainContext::ref_thread_default()
+            .block_on(my_file.trash_future(glib::Priority::DEFAULT));
+        assert!(res.is_err(), "unexpected trashed file");
+        let expected = res.unwrap_err();
+
+        // both errors should equal
+        assert_eq!(err.message(), expected.message());
+        assert_eq!(err.kind::<IOErrorEnum>(), expected.kind::<IOErrorEnum>());
+    });
 }
 
 #[test]

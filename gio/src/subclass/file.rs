@@ -356,6 +356,16 @@ pub trait FileImpl: ObjectImpl + ObjectSubclass<Type: IsA<File>> {
         Self::parent_move(source, destination, flags, cancellable, progress_callback)
     }
 
+    fn move_future<F: FnMut(i64, i64) + Clone + 'static>(
+        source: &File,
+        destination: &File,
+        flags: FileCopyFlags,
+        progress_callback: Option<F>,
+        priority: glib::Priority,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + 'static>> {
+        Self::parent_move_future(source, destination, flags, progress_callback, priority)
+    }
+
     fn mount_mountable<P: FnOnce(&Self::Type, &AsyncResult) + 'static>(
         &self,
         flags: MountMountFlags,
@@ -2797,6 +2807,138 @@ pub trait FileImplExt: FileImpl {
         }
     }
 
+    fn parent_move_async<F: FnMut(i64, i64) + 'static, R: FnOnce(Result<(), Error>) + 'static>(
+        source: &File,
+        destination: &File,
+        flags: FileCopyFlags,
+        progress_callback: Option<F>,
+        priority: glib::Priority,
+        cancellable: Option<&Cancellable>,
+        callback: R,
+    ) {
+        let main_context = glib::MainContext::ref_thread_default();
+        let is_main_context_owner = main_context.is_owner();
+        let has_acquired_main_context = (!is_main_context_owner)
+            .then(|| main_context.acquire().ok())
+            .flatten();
+        assert!(
+            is_main_context_owner || has_acquired_main_context.is_some(),
+            "Async operations only allowed if the thread is owning the MainContext"
+        );
+
+        unsafe {
+            let type_data = Self::type_data();
+            let parent_iface =
+                type_data.as_ref().parent_interface::<File>() as *const ffi::GFileIface;
+
+            let f = (*parent_iface)
+                .move_async
+                .expect("no parent interface implementation for \"move_async\"");
+            let finish = (*parent_iface)
+                .move_finish
+                .expect("no parent interface implementation for \"move_finish\"");
+
+            struct OperationData<F, R> {
+                callback: glib::thread_guard::ThreadGuard<R>,
+                finish_fn: unsafe extern "C" fn(
+                    *mut ffi::GFile,
+                    *mut ffi::GAsyncResult,
+                    *mut *mut glib::ffi::GError,
+                ) -> glib::ffi::gboolean,
+                progress_callback: Option<F>,
+            }
+
+            let super_progress_callback0 = progress_callback;
+            let progress_callback = if super_progress_callback0.is_some() {
+                unsafe extern "C" fn progress_callback_trampoline<
+                    F: FnMut(i64, i64) + 'static,
+                    R: FnOnce(Result<(), Error>) + 'static,
+                >(
+                    current_num_bytes: i64,
+                    total_num_bytes: i64,
+                    user_data: glib::ffi::gpointer,
+                ) {
+                    unsafe {
+                        let operation_data = &mut *(user_data as *mut OperationData<F, R>);
+                        if let Some(ref mut progress_callback) = operation_data.progress_callback {
+                            progress_callback(current_num_bytes, total_num_bytes);
+                        }
+                    }
+                }
+                Some(progress_callback_trampoline::<F, R> as _)
+            } else {
+                None
+            };
+
+            let user_data: Box<OperationData<F, R>> = Box::new(OperationData {
+                callback: glib::thread_guard::ThreadGuard::new(callback),
+                finish_fn: finish,
+                progress_callback: super_progress_callback0,
+            });
+
+            unsafe extern "C" fn move_async_trampoline<
+                F: FnMut(i64, i64) + 'static,
+                R: FnOnce(Result<(), Error>) + 'static,
+            >(
+                source_object_ptr: *mut glib::gobject_ffi::GObject,
+                res: *mut ffi::GAsyncResult,
+                user_data: glib::ffi::gpointer,
+            ) {
+                unsafe {
+                    let mut error = std::ptr::null_mut();
+                    let operation_data: Box<OperationData<F, R>> =
+                        Box::from_raw(user_data as *mut _);
+                    let finish = operation_data.finish_fn;
+                    finish(source_object_ptr as _, res, &mut error);
+                    let result = if error.is_null() {
+                        Ok(())
+                    } else {
+                        Err(from_glib_full(error))
+                    };
+                    let callback = operation_data.callback.into_inner();
+                    callback(result);
+                };
+            }
+
+            let operation_data_ptr = Box::into_raw(user_data);
+            f(
+                source.to_glib_none().0,
+                destination.to_glib_none().0,
+                flags.into_glib(),
+                priority.into_glib(),
+                cancellable.to_glib_none().0,
+                progress_callback,
+                operation_data_ptr as *mut _,
+                Some(move_async_trampoline::<F, R>),
+                operation_data_ptr as *mut _,
+            );
+        }
+    }
+
+    fn parent_move_future<F: FnMut(i64, i64) + Clone + 'static>(
+        source: &File,
+        destination: &File,
+        flags: FileCopyFlags,
+        progress_callback: Option<F>,
+        priority: glib::Priority,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + 'static>> {
+        let destination = destination.clone();
+        let progress_callback = progress_callback.clone();
+        Box::pin(GioFuture::new(source, move |source, cancellable, send| {
+            Self::parent_move_async(
+                source,
+                &destination,
+                flags,
+                progress_callback,
+                priority,
+                Some(cancellable),
+                move |res| {
+                    send.resolve(res);
+                },
+            );
+        }))
+    }
+
     fn parent_mount_mountable<P: FnOnce(&Self::Type, &AsyncResult) + 'static>(
         &self,
         flags: MountMountFlags,
@@ -3889,6 +4031,8 @@ unsafe impl<T: FileImpl> IsImplementable<T> for File {
         iface.copy_async = Some(file_copy_async::<T>);
         iface.copy_finish = Some(file_copy_finish);
         iface.move_ = Some(file_move::<T>);
+        iface.move_async = Some(file_move_async::<T>);
+        iface.move_finish = Some(file_move_finish);
         iface.mount_mountable = Some(file_mount_mountable::<T>);
         iface.mount_mountable_finish = Some(file_mount_mountable_finish::<T>);
         iface.unmount_mountable = Some(file_unmount_mountable::<T>);
@@ -3926,8 +4070,6 @@ unsafe impl<T: FileImpl> IsImplementable<T> for File {
         // iface._query_settable_attributes_finish = Some(_file_query_settable_attributes_finish::<T>);
         // iface._query_writable_namespaces_async = Some(_file_query_writable_namespaces_async::<T>);
         // iface._query_writable_namespaces_finish = Some(_file_query_writable_namespaces_finish::<T>);
-        // iface.move_async = Some(file_move_async::<T>);
-        // iface.move_finish = Some(file_move_finish::<T>);
         // iface.open_readwrite_async = Some(file_open_readwrite_async::<T>);
         // iface.open_readwrite_finish = Some(file_open_readwrite_finish::<T>);
         // iface.create_readwrite_async = Some(file_create_readwrite_async::<T>);
@@ -5613,6 +5755,76 @@ unsafe extern "C" fn file_move<T: FileImpl>(
                     *error = err.to_glib_full()
                 }
                 false.into_glib()
+            }
+        }
+    }
+}
+
+unsafe extern "C" fn file_move_async<T: FileImpl>(
+    source: *mut ffi::GFile,
+    destination: *mut ffi::GFile,
+    flags: ffi::GFileCopyFlags,
+    io_priority: i32,
+    cancellable: *mut ffi::GCancellable,
+    progress_callback: ffi::GFileProgressCallback,
+    progress_callback_data: glib::ffi::gpointer,
+    callback: ffi::GAsyncReadyCallback,
+    user_data: glib::ffi::gpointer,
+) {
+    unsafe {
+        let source: File = from_glib_none(source);
+        let destination: File = from_glib_none(destination);
+        let cancellable: Option<Cancellable> = from_glib_none(cancellable);
+
+        let closure = move |task: LocalTask<bool>, source_object: Option<&glib::Object>| {
+            let result: *mut ffi::GAsyncResult = task.upcast_ref::<AsyncResult>().to_glib_none().0;
+            let source_object: *mut glib::gobject_ffi::GObject = source_object.to_glib_none().0;
+            callback.unwrap()(source_object, result, user_data)
+        };
+
+        let t = LocalTask::new(
+            Some(source.upcast_ref::<glib::Object>()),
+            cancellable.as_ref(),
+            closure,
+        );
+
+        glib::MainContext::ref_thread_default().spawn_local(async move {
+            let progress_callback1 = progress_callback.map(|progress_callback| {
+                move |current_num_bytes, total_num_bytes| {
+                    progress_callback(current_num_bytes, total_num_bytes, progress_callback_data)
+                }
+            });
+
+            let res = T::move_future(
+                &source,
+                &destination,
+                from_glib(flags),
+                progress_callback1,
+                from_glib(io_priority),
+            )
+            .await;
+
+            t.return_result(res.map(|_| true));
+        });
+    }
+}
+
+unsafe extern "C" fn file_move_finish(
+    _source: *mut ffi::GFile,
+    res_ptr: *mut ffi::GAsyncResult,
+    error_ptr: *mut *mut glib::ffi::GError,
+) -> glib::ffi::gboolean {
+    unsafe {
+        let res: AsyncResult = from_glib_none(res_ptr);
+        let t = res.downcast::<LocalTask<bool>>().unwrap();
+        let ret = t.propagate();
+        match ret {
+            Ok(_) => glib::ffi::GTRUE,
+            Err(e) => {
+                if !error_ptr.is_null() {
+                    *error_ptr = e.into_glib_ptr();
+                }
+                glib::ffi::GFALSE
             }
         }
     }

@@ -855,6 +855,30 @@ mod imp {
             }
         }
 
+        fn move_future<F: FnMut(i64, i64) + Clone + 'static>(
+            source: &File,
+            destination: &File,
+            flags: FileCopyFlags,
+            progress_callback: Option<F>,
+            _priority: glib::Priority,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + 'static>>
+        {
+            let destination = destination.to_owned();
+            let mut progress_callback = progress_callback.clone();
+            Box::pin(GioFuture::new(source, move |source, cancellable, send| {
+                let res = Self::move_(
+                    source,
+                    &destination,
+                    flags,
+                    Some(cancellable),
+                    progress_callback
+                        .as_mut()
+                        .map(|f| f as &mut dyn FnMut(i64, i64)),
+                );
+                send.resolve(res);
+            }))
+        }
+
         fn mount_mountable<P: FnOnce(&Self::Type, &AsyncResult) + 'static>(
             &self,
             _flags: MountMountFlags,
@@ -3393,6 +3417,259 @@ fn file_move_() {
 
     // both results should equal
     assert_eq!(res, expected);
+}
+
+#[test]
+fn file_move_future() {
+    // run test in a main context dedicated and configured as the thread default one
+    let _ = glib::MainContext::new().with_thread_default(|| {
+        // invoke `MyCustomFile` implementation of `crate::ffi::GFileIface::move_async/finish`
+        let my_custom_source_file = MyCustomFile::new("/my_file1");
+        let my_custom_destination_file = MyCustomFile::new("/my_file2");
+        let (future, _) = my_custom_source_file.move_future(
+            &my_custom_destination_file,
+            FileCopyFlags::NONE,
+            glib::Priority::DEFAULT,
+        );
+        let res = glib::MainContext::ref_thread_default().block_on(future);
+        assert!(res.is_err(), "unexpected move_");
+        let err = res.unwrap_err();
+
+        // invoke `MyFile` implementation of `crate::ffi::GFileIface::move_async/finish`
+        let my_source_file = MyFile::new("/my_file1");
+        let my_destination_file = MyFile::new("/my_file2");
+        let (future, _) = my_source_file.move_future(
+            &my_destination_file,
+            FileCopyFlags::NONE,
+            glib::Priority::DEFAULT,
+        );
+        let res = glib::MainContext::ref_thread_default().block_on(future);
+        assert!(res.is_err(), "unexpected move_");
+        let expected = res.unwrap_err();
+
+        // both errors should equal
+        assert_eq!(err.message(), expected.message());
+        assert_eq!(err.kind::<IOErrorEnum>(), expected.kind::<IOErrorEnum>());
+        assert_eq!(err.kind::<IOErrorEnum>(), Some(IOErrorEnum::NotFound));
+
+        // invoke `MyCustomFile` implementation of `crate::ffi::GFileIface::move_async/finish`
+        let my_custom_source_file =
+            MyCustomFile::with_type_state("/my_file1", FileType::Regular, MyFileState::Exist);
+        let my_custom_destination_file =
+            MyCustomFile::with_type_state("/my_file2", FileType::Regular, MyFileState::Exist);
+        let (future, _) = my_custom_source_file.move_future(
+            &my_custom_destination_file,
+            FileCopyFlags::NONE,
+            glib::Priority::DEFAULT,
+        );
+        let res = glib::MainContext::ref_thread_default().block_on(future);
+        assert!(res.is_err(), "unexpected move_");
+        let err = res.unwrap_err();
+
+        // invoke `MyFile` implementation of `crate::ffi::GFileIface::move_async/finish`
+        let my_source_file =
+            MyFile::with_type_state("/my_file1", FileType::Regular, MyFileState::Exist);
+        let my_destination_file =
+            MyFile::with_type_state("/my_file2", FileType::Regular, MyFileState::Exist);
+        let (future, _) = my_source_file.move_future(
+            &my_destination_file,
+            FileCopyFlags::NONE,
+            glib::Priority::DEFAULT,
+        );
+        let res = glib::MainContext::ref_thread_default().block_on(future);
+        assert!(res.is_err(), "unexpected move_");
+        let expected = res.unwrap_err();
+
+        // both errors should equal
+        assert_eq!(err.message(), expected.message());
+        assert_eq!(err.kind::<IOErrorEnum>(), expected.kind::<IOErrorEnum>());
+        assert_eq!(err.kind::<IOErrorEnum>(), Some(IOErrorEnum::Exists));
+
+        // invoke `MyCustomFile` implementation of `crate::ffi::GFileIface::move_async/finish`
+        let my_custom_source_file =
+            MyCustomFile::with_type_state("/my_file1", FileType::Regular, MyFileState::Exist);
+        let my_custom_destination_directory =
+            MyCustomFile::with_type_state("/my_dir2", FileType::Directory, MyFileState::Exist);
+        let (future, _) = my_custom_source_file.move_future(
+            &my_custom_destination_directory,
+            FileCopyFlags::OVERWRITE,
+            glib::Priority::DEFAULT,
+        );
+        let res = glib::MainContext::ref_thread_default().block_on(future);
+        assert!(res.is_err(), "unexpected move_");
+        let err = res.unwrap_err();
+
+        // invoke `MyFile` implementation of `crate::ffi::GFileIface::move_async/finish`
+        let my_source_file =
+            MyFile::with_type_state("/my_file1", FileType::Regular, MyFileState::Exist);
+        let my_destination_directory =
+            MyFile::with_type_state("/my_dir2", FileType::Directory, MyFileState::Exist);
+        let (future, _) = my_source_file.move_future(
+            &my_destination_directory,
+            FileCopyFlags::OVERWRITE,
+            glib::Priority::DEFAULT,
+        );
+        let res = glib::MainContext::ref_thread_default().block_on(future);
+        assert!(res.is_err(), "unexpected move_");
+        let expected = res.unwrap_err();
+
+        // both errors should equal
+        assert_eq!(err.message(), expected.message());
+        assert_eq!(err.kind::<IOErrorEnum>(), expected.kind::<IOErrorEnum>());
+        assert_eq!(err.kind::<IOErrorEnum>(), Some(IOErrorEnum::IsDirectory));
+
+        // invoke `MyCustomFile` implementation of `crate::ffi::GFileIface::move_async/finish`
+        let my_custom_source_directory =
+            MyCustomFile::with_type_state("/my_dir1", FileType::Directory, MyFileState::Exist);
+        let my_custom_destination_directory =
+            MyCustomFile::with_type_state("/my_dir2", FileType::Directory, MyFileState::Exist);
+        let (future, _) = my_custom_source_directory.move_future(
+            &my_custom_destination_directory,
+            FileCopyFlags::OVERWRITE,
+            glib::Priority::DEFAULT,
+        );
+        let res = glib::MainContext::ref_thread_default().block_on(future);
+        assert!(res.is_err(), "unexpected move_");
+        let err = res.unwrap_err();
+
+        // invoke `MyFile` implementation of `crate::ffi::GFileIface::move_async/finish`
+        let my_source_directory =
+            MyFile::with_type_state("/my_dir1", FileType::Directory, MyFileState::Exist);
+        let my_destination_directory =
+            MyFile::with_type_state("/my_dir2", FileType::Directory, MyFileState::Exist);
+        let (future, _) = my_source_directory.move_future(
+            &my_destination_directory,
+            FileCopyFlags::OVERWRITE,
+            glib::Priority::DEFAULT,
+        );
+        let res = glib::MainContext::ref_thread_default().block_on(future);
+        assert!(res.is_err(), "unexpected move_");
+        let expected = res.unwrap_err();
+
+        // both errors should equal
+        assert_eq!(err.message(), expected.message());
+        assert_eq!(err.kind::<IOErrorEnum>(), expected.kind::<IOErrorEnum>());
+        assert_eq!(err.kind::<IOErrorEnum>(), Some(IOErrorEnum::WouldMerge));
+
+        // invoke `MyCustomFile` implementation of `crate::ffi::GFileIface::move_async/finish`
+        let my_custom_source_directory =
+            MyCustomFile::with_type_state("/my_dir1", FileType::Directory, MyFileState::Exist);
+        let my_custom_destination_directory = MyCustomFile::with_type_state(
+            "/my_dir2",
+            FileType::Directory,
+            MyFileState::DoesNotExist,
+        );
+        let (future, _) = my_custom_source_directory.move_future(
+            &my_custom_destination_directory,
+            FileCopyFlags::NONE,
+            glib::Priority::DEFAULT,
+        );
+        let res = glib::MainContext::ref_thread_default().block_on(future);
+        assert!(res.is_err(), "unexpected move_");
+        let err = res.unwrap_err();
+
+        // invoke `MyFile` implementation of `crate::ffi::GFileIface::move_async/finish`
+        let my_source_directory =
+            MyFile::with_type_state("/my_dir1", FileType::Directory, MyFileState::Exist);
+        let my_destination_directory =
+            MyFile::with_type_state("/my_dir2", FileType::Directory, MyFileState::DoesNotExist);
+        let (future, _) = my_source_directory.move_future(
+            &my_destination_directory,
+            FileCopyFlags::NONE,
+            glib::Priority::DEFAULT,
+        );
+        let res = glib::MainContext::ref_thread_default().block_on(future);
+        assert!(res.is_err(), "unexpected move_");
+        let expected = res.unwrap_err();
+
+        // both errors should equal
+        assert_eq!(err.message(), expected.message());
+        assert_eq!(err.kind::<IOErrorEnum>(), expected.kind::<IOErrorEnum>());
+        assert_eq!(err.kind::<IOErrorEnum>(), Some(IOErrorEnum::WouldRecurse));
+
+        // invoke `MyCustomFile` implementation of `crate::ffi::GFileIface::move_async/finish`
+        let my_custom_source_directory =
+            MyCustomFile::with_type_state("/my_dir1", FileType::Directory, MyFileState::Exist);
+        let my_custom_destination_file =
+            MyCustomFile::with_type_state("/my_file2", FileType::Regular, MyFileState::Exist);
+        let (future, _) = my_custom_source_directory.move_future(
+            &my_custom_destination_file,
+            FileCopyFlags::OVERWRITE,
+            glib::Priority::DEFAULT,
+        );
+        let res = glib::MainContext::ref_thread_default().block_on(future);
+        assert!(res.is_err(), "unexpected move_");
+        let err = res.unwrap_err();
+
+        // invoke `MyFile` implementation of `crate::ffi::GFileIface::move_async/finish`
+        let my_source_directory =
+            MyFile::with_type_state("/my_dir1", FileType::Directory, MyFileState::Exist);
+        let my_destination_file =
+            MyFile::with_type_state("/my_file2", FileType::Regular, MyFileState::Exist);
+        let (future, _) = my_source_directory.move_future(
+            &my_destination_file,
+            FileCopyFlags::OVERWRITE,
+            glib::Priority::DEFAULT,
+        );
+        let res = glib::MainContext::ref_thread_default().block_on(future);
+        assert!(res.is_err(), "unexpected move_");
+        let expected = res.unwrap_err();
+
+        // both errors should equal
+        assert_eq!(err.message(), expected.message());
+        assert_eq!(err.kind::<IOErrorEnum>(), expected.kind::<IOErrorEnum>());
+        assert_eq!(err.kind::<IOErrorEnum>(), Some(IOErrorEnum::WouldRecurse));
+
+        // invoke `MyCustomFile` implementation of `crate::ffi::GFileIface::move_async/finish`
+        let my_custom_source_file =
+            MyCustomFile::with_type_state("/my_file1", FileType::Regular, MyFileState::Exist);
+        let my_custom_destination_file = MyCustomFile::with_type_state(
+            "/my_file2",
+            FileType::Regular,
+            MyFileState::DoesNotExist,
+        );
+        let (future, mut progress_stream) = my_custom_source_file.move_future(
+            &my_custom_destination_file,
+            FileCopyFlags::NONE,
+            glib::Priority::DEFAULT,
+        );
+        let res = glib::MainContext::ref_thread_default().block_on(future);
+        assert!(res.is_ok(), "{}", res.unwrap_err());
+        let (mut copied, mut total) = (0, 0);
+        while let Some((current_num_bytes, total_num_bytes)) =
+            glib::MainContext::ref_thread_default().block_on(progress_stream.next())
+        {
+            assert!(current_num_bytes >= copied);
+            assert!(total_num_bytes >= total);
+            copied = current_num_bytes;
+            total = total_num_bytes;
+        }
+
+        // invoke `MyFile` implementation of `crate::ffi::GFileIface::move_async/finish`
+        let my_source_file =
+            MyFile::with_type_state("/my_file1", FileType::Regular, MyFileState::Exist);
+        let my_destination_file =
+            MyFile::with_type_state("/my_file2", FileType::Regular, MyFileState::DoesNotExist);
+        let (expected, mut progress_stream) = my_source_file.move_future(
+            &my_destination_file,
+            FileCopyFlags::NONE,
+            glib::Priority::DEFAULT,
+        );
+        let expected = glib::MainContext::ref_thread_default().block_on(expected);
+        assert!(expected.is_ok(), "{}", expected.unwrap_err());
+        let (mut copied, mut total) = (0, 0);
+        while let Some((current_num_bytes, total_num_bytes)) =
+            glib::MainContext::ref_thread_default().block_on(progress_stream.next())
+        {
+            assert!(current_num_bytes >= copied);
+            assert!(total_num_bytes >= total);
+            copied = current_num_bytes;
+            total = total_num_bytes;
+        }
+
+        // both results should equal
+        assert_eq!(res, expected);
+    });
 }
 
 #[test]

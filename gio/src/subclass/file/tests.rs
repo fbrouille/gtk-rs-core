@@ -1054,6 +1054,21 @@ mod imp {
             ))
         }
 
+        fn open_readwrite_future(
+            &self,
+            _priority: glib::Priority,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<FileIOStream, Error>> + 'static>,
+        > {
+            Box::pin(GioFuture::new(
+                &self.ref_counted(),
+                move |self_, cancellable, send| {
+                    let res = self_.open_readwrite(Some(cancellable));
+                    send.resolve(res);
+                },
+            ))
+        }
+
         fn create_readwrite(
             &self,
             _flags: FileCreateFlags,
@@ -4197,6 +4212,38 @@ fn file_open_readwrite() {
     // both errors should equal
     assert_eq!(err.message(), expected.message());
     assert_eq!(err.kind::<IOErrorEnum>(), expected.kind::<IOErrorEnum>());
+}
+
+#[test]
+fn file_open_readwrite_future() {
+    // run test in a main context dedicated and configured as the thread default one
+    let _ = glib::MainContext::new().with_thread_default(|| {
+        // invoke `MyCustomFile` implementation of `crate::ffi::GFileIface::open_readwrite_async/finish`
+        let my_custom_file = MyCustomFile::new("/my_file");
+        let res = glib::MainContext::ref_thread_default()
+            .block_on(my_custom_file.open_readwrite_future(glib::Priority::DEFAULT));
+        assert!(
+            res.is_err(),
+            "unexpected file open read write success {:?}",
+            res.ok().unwrap()
+        );
+        let err = res.unwrap_err();
+
+        // invoke `MyFile` implementation of `crate::ffi::GFileIface::open_readwrite_async/finish`
+        let my_file = MyFile::new("/my_file");
+        let res = glib::MainContext::ref_thread_default()
+            .block_on(my_file.open_readwrite_future(glib::Priority::DEFAULT));
+        assert!(
+            res.is_err(),
+            "unexpected file open read write success {:?}",
+            res.ok().unwrap()
+        );
+        let expected = res.unwrap_err();
+
+        // both errors should equal
+        assert_eq!(err.message(), expected.message());
+        assert_eq!(err.kind::<IOErrorEnum>(), expected.kind::<IOErrorEnum>());
+    });
 }
 
 #[test]

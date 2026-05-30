@@ -1313,6 +1313,30 @@ mod imp {
             Ok((100u64, 10u64, 50u64))
         }
 
+        fn measure_disk_usage_future<F: FnMut(bool, u64, u64, u64) + Clone + 'static>(
+            &self,
+            flags: FileMeasureFlags,
+            progress_callback: Option<F>,
+            _priority: glib::Priority,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(u64, u64, u64), Error>> + 'static>,
+        > {
+            let mut progress_callback = progress_callback.clone();
+            Box::pin(GioFuture::new(
+                &self.ref_counted(),
+                move |self_, cancellable, send| {
+                    let res = self_.measure_disk_usage(
+                        flags,
+                        Some(cancellable),
+                        progress_callback
+                            .as_mut()
+                            .map(|f| f as &mut dyn FnMut(bool, u64, u64, u64)),
+                    );
+                    send.resolve(res);
+                },
+            ))
+        }
+
         fn query_exists(&self, _cancellable: Option<&Cancellable>) -> bool {
             true
         }
@@ -4684,4 +4708,58 @@ fn file_measure_disk_usage() {
 
     // both results should equal
     assert_eq!(result, expected);
+}
+
+#[test]
+fn file_measure_disk_usage_future() {
+    // run test in a main context dedicated and configured as the thread default one
+    let _ = glib::MainContext::new().with_thread_default(|| {
+        // invoke `MyCustomFile` implementation of `crate::ffi::GFileIface::measure_disk_usage_async/finish`
+        let my_custom_file =
+            MyCustomFile::with_type_state("/my_file", FileType::Regular, MyFileState::Exist);
+        let (future, mut progress_stream) = my_custom_file
+            .measure_disk_usage_future(FileMeasureFlags::NONE, glib::Priority::DEFAULT);
+        let res = glib::MainContext::ref_thread_default().block_on(future);
+        assert!(res.is_ok(), "{}", res.unwrap_err());
+        let (mut completed, mut size, mut nb_dirs, mut nb_files) = (false, 0u64, 0u64, 0u64);
+        while let Some((reporting, current_size, num_dirs, num_files)) =
+            glib::MainContext::ref_thread_default().block_on(progress_stream.next())
+        {
+            if reporting {
+                assert!(!completed);
+            }
+            assert!(current_size >= size);
+            assert!(num_dirs >= nb_dirs);
+            assert!(num_files >= nb_files);
+            completed = !reporting;
+            size = current_size;
+            nb_dirs = num_dirs;
+            nb_files = num_files;
+        }
+
+        // invoke `MyFile` implementation of `crate::ffi::GFileIface::measure_disk_usage_async/finish`
+        let my_file = MyFile::with_type_state("/my_file", FileType::Regular, MyFileState::Exist);
+        let (future, mut progress_stream) =
+            my_file.measure_disk_usage_future(FileMeasureFlags::NONE, glib::Priority::DEFAULT);
+        let expected = glib::MainContext::ref_thread_default().block_on(future);
+        assert!(expected.is_ok(), "{}", expected.unwrap_err());
+        let (mut completed, mut size, mut nb_dirs, mut nb_files) = (false, 0u64, 0u64, 0u64);
+        while let Some((reporting, current_size, num_dirs, num_files)) =
+            glib::MainContext::ref_thread_default().block_on(progress_stream.next())
+        {
+            if reporting {
+                assert!(!completed);
+            }
+            assert!(current_size >= size);
+            assert!(num_dirs >= nb_dirs);
+            assert!(num_files >= nb_files);
+            completed = !reporting;
+            size = current_size;
+            nb_dirs = num_dirs;
+            nb_files = num_files;
+        }
+
+        // both results should equal
+        assert_eq!(res, expected);
+    });
 }

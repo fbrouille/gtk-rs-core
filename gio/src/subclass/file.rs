@@ -563,6 +563,17 @@ pub trait FileImpl: ObjectImpl + ObjectSubclass<Type: IsA<File>> {
         self.parent_measure_disk_usage(flags, cancellable, progress_callback)
     }
 
+    fn measure_disk_usage_future<F: FnMut(bool, u64, u64, u64) + Clone + 'static>(
+        &self,
+        flags: FileMeasureFlags,
+        progress_callback: Option<F>,
+        priority: glib::Priority,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(u64, u64, u64), Error>> + 'static>,
+    > {
+        self.parent_measure_disk_usage_future(flags, progress_callback, priority)
+    }
+
     fn query_exists(&self, cancellable: Option<&Cancellable>) -> bool {
         self.parent_query_exists(cancellable)
     }
@@ -4233,6 +4244,161 @@ pub trait FileImplExt: FileImpl {
         }
     }
 
+    fn parent_measure_disk_usage_async<
+        F: FnMut(bool, u64, u64, u64) + 'static,
+        R: FnOnce(Result<(u64, u64, u64), Error>) + 'static,
+    >(
+        &self,
+        flags: FileMeasureFlags,
+        progress_callback: Option<F>,
+        priority: glib::Priority,
+        cancellable: Option<&Cancellable>,
+        callback: R,
+    ) {
+        let main_context = glib::MainContext::ref_thread_default();
+        let is_main_context_owner = main_context.is_owner();
+        let has_acquired_main_context = (!is_main_context_owner)
+            .then(|| main_context.acquire().ok())
+            .flatten();
+        assert!(
+            is_main_context_owner || has_acquired_main_context.is_some(),
+            "Async operations only allowed if the thread is owning the MainContext"
+        );
+
+        unsafe {
+            let type_data = Self::type_data();
+            let parent_iface =
+                type_data.as_ref().parent_interface::<File>() as *const ffi::GFileIface;
+
+            let f = (*parent_iface)
+                .measure_disk_usage_async
+                .expect("no parent interface implementation for \"measure_disk_usage_async\"");
+            let finish = (*parent_iface)
+                .measure_disk_usage_finish
+                .expect("no parent interface implementation for \"measure_disk_usage_finish\"");
+
+            struct OperationData<F, R> {
+                callback: glib::thread_guard::ThreadGuard<R>,
+                finish_fn: unsafe extern "C" fn(
+                    *mut ffi::GFile,
+                    *mut ffi::GAsyncResult,
+                    *mut u64,
+                    *mut u64,
+                    *mut u64,
+                    *mut *mut glib::ffi::GError,
+                ) -> glib::ffi::gboolean,
+                progress_callback: Option<F>,
+            }
+
+            let super_progress_callback0 = progress_callback;
+            let progress_callback = if super_progress_callback0.is_some() {
+                unsafe extern "C" fn progress_callback_trampoline<
+                    F: FnMut(bool, u64, u64, u64) + 'static,
+                    R: FnOnce(Result<(u64, u64, u64), Error>) + 'static,
+                >(
+                    reporting: glib::ffi::gboolean,
+                    current_size: u64,
+                    num_dirs: u64,
+                    num_files: u64,
+                    user_data: glib::ffi::gpointer,
+                ) {
+                    unsafe {
+                        let operation_data = &mut *(user_data as *mut OperationData<F, R>);
+                        if let Some(ref mut progress_callback) = operation_data.progress_callback {
+                            progress_callback(
+                                from_glib(reporting),
+                                current_size,
+                                num_dirs,
+                                num_files,
+                            );
+                        }
+                    }
+                }
+                Some(progress_callback_trampoline::<F, R> as _)
+            } else {
+                None
+            };
+
+            let user_data: Box<OperationData<F, R>> = Box::new(OperationData {
+                callback: glib::thread_guard::ThreadGuard::new(callback),
+                finish_fn: finish,
+                progress_callback: super_progress_callback0,
+            });
+
+            unsafe extern "C" fn measure_disk_usage_async_trampoline<
+                F: FnMut(bool, u64, u64, u64) + 'static,
+                R: FnOnce(Result<(u64, u64, u64), Error>) + 'static,
+            >(
+                source_object_ptr: *mut glib::gobject_ffi::GObject,
+                res: *mut ffi::GAsyncResult,
+                user_data: glib::ffi::gpointer,
+            ) {
+                unsafe {
+                    let mut error = std::ptr::null_mut();
+                    let mut disk_usage = 0u64;
+                    let mut num_dirs = 0u64;
+                    let mut num_files = 0u64;
+                    let operation_data: Box<OperationData<F, R>> =
+                        Box::from_raw(user_data as *mut _);
+                    let finish = operation_data.finish_fn;
+                    let is_ok = finish(
+                        source_object_ptr as _,
+                        res,
+                        &mut disk_usage,
+                        &mut num_dirs,
+                        &mut num_files,
+                        &mut error,
+                    );
+                    debug_assert_eq!(is_ok == glib::ffi::GFALSE, !error.is_null());
+                    let result = if error.is_null() {
+                        Ok((disk_usage, num_dirs, num_files))
+                    } else {
+                        Err(from_glib_full(error))
+                    };
+                    let callback = operation_data.callback.into_inner();
+                    callback(result);
+                };
+            }
+
+            let operation_data_ptr = Box::into_raw(user_data);
+            f(
+                self.obj().unsafe_cast_ref::<File>().to_glib_none().0,
+                flags.into_glib(),
+                priority.into_glib(),
+                cancellable.to_glib_none().0,
+                progress_callback,
+                operation_data_ptr as *mut _,
+                Some(measure_disk_usage_async_trampoline::<F, R>),
+                operation_data_ptr as *mut _,
+            );
+        }
+    }
+
+    fn parent_measure_disk_usage_future<F: FnMut(bool, u64, u64, u64) + Clone + 'static>(
+        &self,
+        flags: FileMeasureFlags,
+        progress_callback: Option<F>,
+        priority: glib::Priority,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(u64, u64, u64), Error>> + 'static>,
+    > {
+        let progress_callback = progress_callback.clone();
+        Box::pin(GioFuture::new(
+            &self.ref_counted(),
+            move |imp, cancellable, send| {
+                imp.parent_measure_disk_usage_async(
+                    flags,
+                    progress_callback,
+                    priority,
+                    Some(cancellable),
+                    move |res| {
+                        send.resolve(res);
+                    },
+                );
+            },
+        ))
+    }
+
     fn parent_query_exists(&self, cancellable: Option<&Cancellable>) -> bool {
         unsafe {
             let type_data = Self::type_data();
@@ -4363,18 +4529,12 @@ unsafe impl<T: FileImpl> IsImplementable<T> for File {
         iface.poll_mountable = Some(file_poll_mountable::<T>);
         iface.poll_mountable_finish = Some(file_poll_mountable_finish::<T>);
         iface.measure_disk_usage = Some(file_measure_disk_usage::<T>);
+        iface.measure_disk_usage_async = Some(file_measure_disk_usage_async::<T>);
+        iface.measure_disk_usage_finish = Some(file_measure_disk_usage_finish);
         #[cfg(feature = "v2_84")]
         {
             iface.query_exists = Some(file_query_exists::<T>);
         }
-        // `GFile` already implements `xxx_async/xxx_finish` vfuncs and this should be ok.
-        // TODO: when needed, override the `GFile` implementation of the following vfuncs:
-        // iface._query_settable_attributes_async = Some(_file_query_settable_attributes_async::<T>);
-        // iface._query_settable_attributes_finish = Some(_file_query_settable_attributes_finish::<T>);
-        // iface._query_writable_namespaces_async = Some(_file_query_writable_namespaces_async::<T>);
-        // iface._query_writable_namespaces_finish = Some(_file_query_writable_namespaces_finish::<T>);
-        // iface.measure_disk_usage_async = Some(file_measure_disk_usage_async::<T>);
-        // iface.measure_disk_usage_finish = Some(file_measure_disk_usage_finish::<T>);
     }
 }
 
@@ -6958,6 +7118,110 @@ unsafe extern "C" fn file_measure_disk_usage<T: FileImpl>(
             Err(err) => {
                 if !error.is_null() {
                     *error = err.to_glib_full()
+                }
+                false.into_glib()
+            }
+        }
+    }
+}
+
+unsafe extern "C" fn file_measure_disk_usage_async<T: FileImpl>(
+    file: *mut ffi::GFile,
+    flags: ffi::GFileMeasureFlags,
+    io_priority: i32,
+    cancellable: *mut ffi::GCancellable,
+    progress_callback: ffi::GFileMeasureProgressCallback,
+    progress_callback_data: glib::ffi::gpointer,
+    callback: ffi::GAsyncReadyCallback,
+    user_data: glib::ffi::gpointer,
+) {
+    unsafe {
+        let instance = &*(file as *mut T::Instance);
+        let imp = instance.imp();
+        let wrap: File = from_glib_none(file);
+        let cancellable: Option<Cancellable> = from_glib_none(cancellable);
+
+        // Create a box to store progress callback info
+        let progress_data: Box<(ffi::GFileMeasureProgressCallback, glib::ffi::gpointer)> =
+            Box::new((progress_callback, progress_callback_data));
+
+        let closure = move |task: LocalTask<glib::Variant>,
+                            source_object: Option<&glib::Object>| {
+            let result: *mut ffi::GAsyncResult = task.upcast_ref::<AsyncResult>().to_glib_none().0;
+            let source_object: *mut glib::gobject_ffi::GObject = source_object.to_glib_none().0;
+            callback.unwrap()(source_object, result, user_data)
+        };
+
+        let t = LocalTask::new(
+            Some(wrap.upcast_ref::<glib::Object>()),
+            cancellable.as_ref(),
+            closure,
+        );
+
+        glib::MainContext::ref_thread_default().spawn_local(async move {
+            // Create a progress callback closure for the async operation
+            let progress_closure = if progress_callback.is_some() {
+                let progress_data = progress_data.clone();
+                Some(
+                    move |reporting: bool, current_size: u64, num_dirs: u64, num_files: u64| {
+                        if let Some(callback) = progress_data.0 {
+                            callback(
+                                reporting.into_glib(),
+                                current_size,
+                                num_dirs,
+                                num_files,
+                                progress_data.1,
+                            )
+                        }
+                    },
+                )
+            } else {
+                None
+            };
+
+            let res = imp
+                .measure_disk_usage_future(
+                    from_glib(flags),
+                    progress_closure,
+                    from_glib(io_priority),
+                )
+                .await;
+
+            t.return_result(res.map(|res| res.to_variant()));
+        });
+    }
+}
+
+unsafe extern "C" fn file_measure_disk_usage_finish(
+    _file: *mut ffi::GFile,
+    res_ptr: *mut ffi::GAsyncResult,
+    disk_usage: *mut u64,
+    num_dirs: *mut u64,
+    num_files: *mut u64,
+    error_ptr: *mut *mut glib::ffi::GError,
+) -> glib::ffi::gboolean {
+    unsafe {
+        let res: AsyncResult = from_glib_none(res_ptr);
+        let t = res.downcast::<LocalTask<glib::Variant>>().unwrap();
+        let ret = t.propagate();
+        match ret {
+            Ok(variant) => {
+                let (disk_usage_, num_dirs_, num_files_) =
+                    variant.get::<(u64, u64, u64)>().unwrap();
+                if !disk_usage.is_null() {
+                    *disk_usage = disk_usage_
+                }
+                if !num_dirs.is_null() {
+                    *num_dirs = num_dirs_
+                }
+                if !num_files.is_null() {
+                    *num_files = num_files_
+                }
+                true.into_glib()
+            }
+            Err(e) => {
+                if !error_ptr.is_null() {
+                    *error_ptr = e.into_glib_ptr();
                 }
                 false.into_glib()
             }

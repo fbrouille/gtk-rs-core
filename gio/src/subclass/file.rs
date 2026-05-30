@@ -475,6 +475,17 @@ pub trait FileImpl: ObjectImpl + ObjectSubclass<Type: IsA<File>> {
         self.parent_replace_readwrite(etag, make_backup, flags, cancellable)
     }
 
+    fn replace_readwrite_future(
+        &self,
+        etag: Option<&str>,
+        make_backup: bool,
+        flags: FileCreateFlags,
+        priority: glib::Priority,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<FileIOStream, Error>> + 'static>>
+    {
+        self.parent_replace_readwrite_future(etag, make_backup, flags, priority)
+    }
+
     fn start_mountable<P: FnOnce(&Self::Type, &AsyncResult) + 'static>(
         &self,
         flags: DriveStartFlags,
@@ -3634,6 +3645,106 @@ pub trait FileImplExt: FileImpl {
         }
     }
 
+    fn parent_replace_readwrite_async<R: FnOnce(Result<FileIOStream, Error>) + 'static>(
+        &self,
+        etag: Option<&str>,
+        make_backup: bool,
+        flags: FileCreateFlags,
+        priority: glib::Priority,
+        cancellable: Option<&Cancellable>,
+        callback: R,
+    ) {
+        let main_context = glib::MainContext::ref_thread_default();
+        let is_main_context_owner = main_context.is_owner();
+        let has_acquired_main_context = (!is_main_context_owner)
+            .then(|| main_context.acquire().ok())
+            .flatten();
+        assert!(
+            is_main_context_owner || has_acquired_main_context.is_some(),
+            "Async operations only allowed if the thread is owning the MainContext"
+        );
+        unsafe {
+            let type_data = Self::type_data();
+            let parent_iface =
+                type_data.as_ref().parent_interface::<File>() as *const ffi::GFileIface;
+
+            let f = (*parent_iface)
+                .replace_readwrite_async
+                .expect("no parent interface implementation for \"replace_readwrite_async\"");
+            let finish = (*parent_iface)
+                .replace_readwrite_finish
+                .expect("no parent interface \"replace_readwrite_finish\" implementation");
+
+            let user_data: Box<(glib::thread_guard::ThreadGuard<R>, _)> =
+                Box::new((glib::thread_guard::ThreadGuard::new(callback), finish));
+
+            unsafe extern "C" fn replace_readwrite_async_trampoline<
+                T: FnOnce(Result<FileIOStream, Error>) + 'static,
+            >(
+                source_object_ptr: *mut glib::gobject_ffi::GObject,
+                res: *mut ffi::GAsyncResult,
+                user_data: glib::ffi::gpointer,
+            ) {
+                unsafe {
+                    let mut error = std::ptr::null_mut();
+                    let cb: Box<(
+                        glib::thread_guard::ThreadGuard<T>,
+                        unsafe extern "C" fn(
+                            *mut gio_sys::GFile,
+                            *mut gio_sys::GAsyncResult,
+                            *mut *mut glib::ffi::GError,
+                        ) -> *mut ffi::GFileIOStream,
+                    )> = Box::from_raw(user_data as *mut _);
+                    let ret = cb.1(source_object_ptr as _, res, &mut error);
+                    let result = if error.is_null() {
+                        Ok(from_glib_full(ret))
+                    } else {
+                        Err(from_glib_full(error))
+                    };
+                    let cb = cb.0.into_inner();
+                    cb(result);
+                };
+            }
+
+            f(
+                self.obj().unsafe_cast_ref::<File>().to_glib_none().0,
+                etag.to_glib_none().0,
+                make_backup.into_glib(),
+                flags.into_glib(),
+                priority.into_glib(),
+                cancellable.to_glib_none().0,
+                Some(replace_readwrite_async_trampoline::<R>),
+                Box::into_raw(user_data) as *mut _,
+            );
+        }
+    }
+
+    fn parent_replace_readwrite_future(
+        &self,
+        etag: Option<&str>,
+        make_backup: bool,
+        flags: FileCreateFlags,
+        priority: glib::Priority,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<FileIOStream, Error>> + 'static>>
+    {
+        let etag = etag.map(String::from);
+        Box::pin(GioFuture::new(
+            &self.ref_counted(),
+            move |imp, cancellable, send| {
+                imp.parent_replace_readwrite_async(
+                    etag.as_deref(),
+                    make_backup,
+                    flags,
+                    priority,
+                    Some(cancellable),
+                    move |res| {
+                        send.resolve(res);
+                    },
+                );
+            },
+        ))
+    }
+
     fn parent_start_mountable<P: FnOnce(&Self::Type, &AsyncResult) + 'static>(
         &self,
         flags: DriveStartFlags,
@@ -4236,6 +4347,8 @@ unsafe impl<T: FileImpl> IsImplementable<T> for File {
         iface.create_readwrite_async = Some(file_create_readwrite_async::<T>);
         iface.create_readwrite_finish = Some(file_create_readwrite_finish);
         iface.replace_readwrite = Some(file_replace_readwrite::<T>);
+        iface.replace_readwrite_async = Some(file_replace_readwrite_async::<T>);
+        iface.replace_readwrite_finish = Some(file_replace_readwrite_finish);
         iface.start_mountable = Some(file_start_mountable::<T>);
         iface.start_mountable_finish = Some(file_start_mountable_finish::<T>);
         iface.stop_mountable = Some(file_stop_mountable::<T>);
@@ -4260,8 +4373,6 @@ unsafe impl<T: FileImpl> IsImplementable<T> for File {
         // iface._query_settable_attributes_finish = Some(_file_query_settable_attributes_finish::<T>);
         // iface._query_writable_namespaces_async = Some(_file_query_writable_namespaces_async::<T>);
         // iface._query_writable_namespaces_finish = Some(_file_query_writable_namespaces_finish::<T>);
-        // iface.replace_readwrite_async = Some(file_replace_readwrite_async::<T>);
-        // iface.replace_readwrite_finish = Some(file_replace_readwrite_finish::<T>);
         // iface.measure_disk_usage_async = Some(file_measure_disk_usage_async::<T>);
         // iface.measure_disk_usage_finish = Some(file_measure_disk_usage_finish::<T>);
     }
@@ -6459,6 +6570,71 @@ unsafe extern "C" fn file_replace_readwrite<T: FileImpl>(
                     *error = err.to_glib_full()
                 }
                 std::ptr::null_mut()
+            }
+        }
+    }
+}
+
+unsafe extern "C" fn file_replace_readwrite_async<T: FileImpl>(
+    file: *mut ffi::GFile,
+    etag: *const c_char,
+    make_backup: glib::ffi::gboolean,
+    flags: ffi::GFileCreateFlags,
+    io_priority: i32,
+    cancellable: *mut ffi::GCancellable,
+    callback: ffi::GAsyncReadyCallback,
+    user_data: glib::ffi::gpointer,
+) {
+    unsafe {
+        let instance = &*(file as *mut T::Instance);
+        let imp = instance.imp();
+        let wrap: File = from_glib_none(file);
+        let cancellable: Option<Cancellable> = from_glib_none(cancellable);
+        let etag = Option::<GString>::from_glib_none(etag);
+
+        let closure = move |task: LocalTask<FileIOStream>, source_object: Option<&glib::Object>| {
+            let result: *mut ffi::GAsyncResult = task.upcast_ref::<AsyncResult>().to_glib_none().0;
+            let source_object: *mut glib::gobject_ffi::GObject = source_object.to_glib_none().0;
+            callback.unwrap()(source_object, result, user_data)
+        };
+
+        let t = LocalTask::new(
+            Some(wrap.upcast_ref::<glib::Object>()),
+            cancellable.as_ref(),
+            closure,
+        );
+
+        glib::MainContext::ref_thread_default().spawn_local(async move {
+            let res = imp
+                .replace_readwrite_future(
+                    etag.as_ref().map(|etag| etag.as_str()),
+                    from_glib(make_backup),
+                    from_glib(flags),
+                    from_glib(io_priority),
+                )
+                .await;
+
+            t.return_result(res);
+        });
+    }
+}
+
+unsafe extern "C" fn file_replace_readwrite_finish(
+    _file: *mut ffi::GFile,
+    res_ptr: *mut ffi::GAsyncResult,
+    error_ptr: *mut *mut glib::ffi::GError,
+) -> *mut ffi::GFileIOStream {
+    unsafe {
+        let res: AsyncResult = from_glib_none(res_ptr);
+        let t = res.downcast::<LocalTask<FileIOStream>>().unwrap();
+        let ret = t.propagate();
+        match ret {
+            Ok(val) => val.to_glib_full(),
+            Err(e) => {
+                if !error_ptr.is_null() {
+                    *error_ptr = e.into_glib_ptr();
+                }
+                Ptr::from::<()>(std::ptr::null_mut())
             }
         }
     }
